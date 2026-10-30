@@ -1,0 +1,8 @@
+[package]
+name = "calc"
+version = "0.1.0"
+type = "executable"
+cxx_standard = 20
+
+[dependencies]
+mathx = { path = "deps/mathx" }

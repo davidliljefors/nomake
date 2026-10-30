@@ -1,0 +1,5 @@
+[package]
+name = "mathx"
+version = "0.1.0"
+type = "static"
+cxx_standard = 20

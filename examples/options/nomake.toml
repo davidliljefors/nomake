@@ -1,0 +1,12 @@
+[package]
+name = "options"
+version = "0.1.0"
+type = "executable"
+cxx_standard = "17"
+
+[sources]
+dirs = ["src"]
+exclude = ["src/experimental/**"]
+
+[build]
+defines = ["APP_LEVEL=3", "ENABLE_TRACE"]
