@@ -176,11 +176,6 @@ pub fn new(name: &str, kind: Kind) -> Result<()> {
         bail!("{name} already exists");
     }
     fs::create_dir_all(dir.join("src"))?;
-    let (kind_str, deps_hint) = match kind {
-        Kind::Executable => ("executable", "\n[dependencies]\n# imgui = { path = \"deps/imgui\" }  # run `nomake init` inside deps/imgui first\n"),
-        Kind::Static => ("static", ""),
-        Kind::Shared => ("shared", ""),
-    };
     fs::write(
         dir.join("nomake.toml"),
         format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\ntype = \"{kind_str}\"\ncxx_standard = \"20\"\n{deps_hint}"),
