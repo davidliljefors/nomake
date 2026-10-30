@@ -2,7 +2,10 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::time::{Duration, Instant};
 
 use toml_edit::{DocumentMut, Item};
 
@@ -193,7 +196,7 @@ pub struct Model {
     pub baseline: Option<String>,
 }
 
-fn scan_dir(root: &Path, dir: &Path, index: usize, nodes: &mut Vec<Node>) {
+fn scan_dir(root: &Path, dir: &Path, index: usize, nodes: &mut Vec<Node>, seen: &AtomicUsize) {
     let Ok(read) = fs::read_dir(dir) else { return };
     let mut entries: Vec<(bool, fs::DirEntry)> = read
         .flatten()
@@ -229,10 +232,35 @@ fn scan_dir(root: &Path, dir: &Path, index: usize, nodes: &mut Vec<Node>) {
             hdr_total: (kind == NodeKind::Header) as usize,
         });
         nodes[index].children.push(child);
+        seen.store(nodes.len(), Relaxed);
         if is_dir && !locked {
-            scan_dir(root, &path, child, nodes);
+            scan_dir(root, &path, child, nodes, seen);
             nodes[child].end = nodes.len();
         }
+    }
+}
+
+/// Shows progress on stderr once a scan has taken a noticeable time, so a big folder doesn't look like a hang.
+fn spin(seen: &AtomicUsize, done: &AtomicBool) {
+    const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+    let start = Instant::now();
+    let mut shown = false;
+    let mut frame = 0;
+    while !done.load(Relaxed) {
+        std::thread::park_timeout(Duration::from_millis(100));
+        if done.load(Relaxed) || start.elapsed() < Duration::from_millis(200) {
+            continue;
+        }
+        eprint!(
+            "\r{} Scanning directories... {} entries (Ctrl+C to cancel)",
+            FRAMES[frame % FRAMES.len()],
+            seen.load(Relaxed)
+        );
+        frame += 1;
+        shown = true;
+    }
+    if shown {
+        eprint!("\r{:70}\r", "");
     }
 }
 
@@ -250,7 +278,18 @@ fn scan_tree(root: &Path) -> Vec<Node> {
         src_total: 0,
         hdr_total: 0,
     }];
-    scan_dir(root, root, 0, &mut nodes);
+    let seen = AtomicUsize::new(0);
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let spinner = std::io::stderr()
+            .is_terminal()
+            .then(|| scope.spawn(|| spin(&seen, &done)));
+        scan_dir(root, root, 0, &mut nodes, &seen);
+        done.store(true, Relaxed);
+        if let Some(spinner) = &spinner {
+            spinner.thread().unpark();
+        }
+    });
     nodes[0].end = nodes.len();
     for index in (1..nodes.len()).rev() {
         let parent = nodes[index].parent;
