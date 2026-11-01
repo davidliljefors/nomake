@@ -27,9 +27,9 @@ fn fingerprint(graph: &Graph) -> u64 {
     util::hash(&bytes)
 }
 
-/// Writes the database and records its fingerprint in `stamp`; returns the number of entries.
-pub fn generate(graph: &Graph, stamp: &Path) -> Result<usize> {
-    let entries: Vec<String> = graph
+/// One JSON object per compiled source.
+pub fn entries(graph: &Graph) -> Vec<String> {
+    graph
         .nodes
         .iter()
         .filter(|node| node.kind == NodeKind::Compile)
@@ -45,11 +45,23 @@ pub fn generate(graph: &Graph, stamp: &Path) -> Result<usize> {
                 args.join(", ")
             )
         })
-        .collect();
-    fs::write(
-        graph.root_dir.join(FILE),
-        format!("[\n{}\n]\n", entries.join(",\n")),
-    )?;
+        .collect()
+}
+
+/// Writes `compile_commands.json` into `dir`, leaving the file alone when nothing changed.
+pub fn write(dir: &Path, entries: &[String]) -> Result<()> {
+    let text = format!("[\n{}\n]\n", entries.join(",\n"));
+    let path = dir.join(FILE);
+    if fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+        fs::write(path, text)?;
+    }
+    Ok(())
+}
+
+/// Writes the database and records its fingerprint in `stamp`; returns the number of entries.
+pub fn generate(graph: &Graph, stamp: &Path) -> Result<usize> {
+    let entries = entries(graph);
+    write(&graph.root_dir, &entries)?;
     fs::create_dir_all(stamp.parent().unwrap())?;
     fs::write(stamp, fingerprint(graph).to_string())?;
     Ok(entries.len())

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::{Arch, Toolchain};
 use crate::commands::out_dir;
+use crate::config::Kind;
 use crate::dag::compile_scope;
 use crate::scanner::{self, is_header, Pkg, Workspace};
 use crate::util::{absolute, hash, hash_seeded};
@@ -58,6 +59,8 @@ struct Context<'a> {
     archs: &'a [Arch],
     root_dir: PathBuf,
     nomake: PathBuf,
+    /// Member projects name themselves on the command line so a build covers just them.
+    workspace: bool,
 }
 
 struct Item {
@@ -66,20 +69,35 @@ struct Item {
     filter: Option<String>,
 }
 
+struct Project {
+    name: String,
+    /// Part of the solution build; packages that are only dependencies are browse-only.
+    builds: bool,
+    executable: bool,
+}
+
 pub fn generate(archs: &[Arch]) -> Result<()> {
     let root_dir = absolute(Path::new("."));
-    let ws = scanner::load(&root_dir)?;
-    let tc = Toolchain::detect(&ws.root().toolchain, Arch::host(), &root_dir.join("build"))?;
+    generate_for(&root_dir, std::slice::from_ref(&root_dir), archs)
+}
+
+/// One solution in `root_dir` holding the packages in `member_dirs`, all building into its build/.
+pub fn generate_for(root_dir: &Path, member_dirs: &[PathBuf], archs: &[Arch]) -> Result<()> {
     let vs_dir = root_dir.join("build").join("vs");
     fs::create_dir_all(&vs_dir)?;
+    let ws = scanner::load_roots(root_dir, member_dirs)?;
+    let tc = Toolchain::detect(&ws.root().toolchain, Arch::host(), &root_dir.join("build"))?;
+    let workspace = !(member_dirs.len() == 1 && member_dirs[0] == root_dir);
     let ctx = Context {
         ws: &ws,
         tc: &tc,
         archs,
-        root_dir,
+        root_dir: root_dir.to_path_buf(),
         nomake: std::env::current_exe()?,
+        workspace,
     };
 
+    let mut projects: Vec<Project> = Vec::new();
     for (index, pkg) in ws.pkgs.iter().enumerate() {
         let items = collect_items(pkg);
         fs::write(
@@ -90,13 +108,27 @@ pub fn generate(archs: &[Arch]) -> Result<()> {
             vs_dir.join(format!("{}.vcxproj.filters", pkg.name)),
             filters_xml(pkg, &items),
         )?;
+        projects.push(Project {
+            name: pkg.name.clone(),
+            builds: ws.roots.contains(&index),
+            executable: pkg.kind == Kind::Executable,
+        });
     }
-    let solution = vs_dir.join(format!("{}.sln", ws.root().name));
-    fs::write(&solution, solution_text(&ws, archs))?;
+    // Visual Studio starts the first project of the solution, so programs go first.
+    projects.sort_by_key(|p| (!p.builds, !p.executable));
+    let solution_name = if workspace {
+        root_dir
+            .file_name()
+            .map_or_else(|| "nomake".to_string(), |n| n.to_string_lossy().into_owned())
+    } else {
+        ws.root().name.clone()
+    };
+    let solution = vs_dir.join(format!("{solution_name}.sln"));
+    fs::write(&solution, solution_text(&projects, archs))?;
     println!(
         "nomake: wrote {} ({} projects)",
         solution.display(),
-        ws.pkgs.len()
+        projects.len()
     );
     Ok(())
 }
@@ -273,9 +305,14 @@ fn config_properties(ctx: &Context, index: usize, config: &Config) -> String {
     let nomake = ctx.nomake.display();
     let flag = if release { " -r" } else { "" };
     let arch = config.arch.name();
-    let build = format!("cd /d \"{root}\" && \"{nomake}\" build --arch {arch}{flag}");
+    let member = if ctx.workspace && ctx.ws.roots.contains(&index) {
+        format!(" {}", pkg.name)
+    } else {
+        String::new()
+    };
+    let build = format!("cd /d \"{root}\" && \"{nomake}\" build{member} --arch {arch}{flag}");
     let clean = format!("cd /d \"{root}\" && \"{nomake}\" clean --arch {arch}{flag}");
-    let rebuild = format!("{clean} && \"{nomake}\" build --arch {arch}{flag}");
+    let rebuild = format!("{clean} && \"{nomake}\" build{member} --arch {arch}{flag}");
     let output = out.join(ctx.tc.artifact(pkg.kind, &pkg.name).0);
 
     let mut text = String::new();
@@ -343,23 +380,23 @@ fn filters_xml(pkg: &Pkg, items: &[Item]) -> String {
     text
 }
 
-/// Only the root project builds with the solution: one `nomake build` already covers every package.
-fn solution_text(ws: &Workspace, archs: &[Arch]) -> String {
-    let root_index = ws.pkgs.len() - 1;
+/// Member projects build with the solution; each member's own `nomake build` already covers its dependencies.
+fn solution_text(projects: &[Project], archs: &[Arch]) -> String {
+    let has_deps = projects.iter().any(|p| !p.builds);
     let deps_folder = guid("nomake:deps");
     let mut text = String::new();
     text.push_str("Microsoft Visual Studio Solution File, Format Version 12.00\n");
     text.push_str("# Visual Studio Version 17\n");
     text.push_str("MinimumVisualStudioVersion = 10.0.40219.1\n");
-    for index in (0..ws.pkgs.len()).rev() {
-        let name = &ws.pkgs[index].name;
+    for project in projects {
+        let name = &project.name;
         text.push_str(&format!(
             "Project(\"{CPP_PROJECT_TYPE}\") = \"{name}\", \"{name}.vcxproj\", \"{}\"\n",
             guid(name)
         ));
         text.push_str("EndProject\n");
     }
-    if root_index > 0 {
+    if has_deps {
         text.push_str(&format!(
             "Project(\"{SOLUTION_FOLDER_TYPE}\") = \"deps\", \"deps\", \"{deps_folder}\"\n"
         ));
@@ -372,17 +409,17 @@ fn solution_text(ws: &Workspace, archs: &[Arch]) -> String {
     }
     text.push_str("\tEndGlobalSection\n");
     text.push_str("\tGlobalSection(ProjectConfigurationPlatforms) = postSolution\n");
-    for index in (0..ws.pkgs.len()).rev() {
-        let project = guid(&ws.pkgs[index].name);
+    for project in projects {
+        let guid = guid(&project.name);
         for config in configs(archs) {
             text.push_str(&format!(
-                "\t\t{project}.{}.ActiveCfg = {}\n",
+                "\t\t{guid}.{}.ActiveCfg = {}\n",
                 config.key(),
                 config.key()
             ));
-            if index == root_index {
+            if project.builds {
                 text.push_str(&format!(
-                    "\t\t{project}.{}.Build.0 = {}\n",
+                    "\t\t{guid}.{}.Build.0 = {}\n",
                     config.key(),
                     config.key()
                 ));
@@ -393,10 +430,10 @@ fn solution_text(ws: &Workspace, archs: &[Arch]) -> String {
     text.push_str("\tGlobalSection(SolutionProperties) = preSolution\n");
     text.push_str("\t\tHideSolutionNode = FALSE\n");
     text.push_str("\tEndGlobalSection\n");
-    if root_index > 0 {
+    if has_deps {
         text.push_str("\tGlobalSection(NestedProjects) = preSolution\n");
-        for pkg in &ws.pkgs[..root_index] {
-            text.push_str(&format!("\t\t{} = {deps_folder}\n", guid(&pkg.name)));
+        for project in projects.iter().filter(|p| !p.builds) {
+            text.push_str(&format!("\t\t{} = {deps_folder}\n", guid(&project.name)));
         }
         text.push_str("\tEndGlobalSection\n");
     }

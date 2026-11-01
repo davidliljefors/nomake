@@ -71,6 +71,7 @@ fn has_main(path: &Path) -> bool {
 pub fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Kind::Executable => "executable",
+        Kind::Test => "test",
         Kind::Static => "static",
         Kind::Shared => "shared",
     }

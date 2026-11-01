@@ -12,7 +12,9 @@ mod registry;
 mod scanner;
 mod state;
 mod toolchain;
+mod testrun;
 mod util;
+mod workspace;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -36,9 +38,17 @@ COMMANDS:
     cache clean                  Delete the shared source cache
     build [-r] [-a ARCH] [-j N]  Build the project
     run [-r] [-a ARCH] [-- args] Build and run the executable
+    test [-r] [-a ARCH] [-- args] Build and run the packages of type \"test\" (exit code 0 = pass)
     compdb [-r] [-a ARCH]        Write compile_commands.json
     vs [-a ARCH,...]             Write a Visual Studio solution to build/vs/
     clean [-r] [-a ARCH]         Remove build/ (keeps build/vs/), or just one configuration
+
+WORKSPACES:
+    A nomake.toml with a [workspace] table (members = [\"libs/*\", \"app\"]) makes build, run, clean,
+    compdb and vs act on every member. Name members to pick some: `nomake build app tests`,
+    `nomake run app`. `build` skips members of type \"test\" unless named; `nomake test` runs them
+    (`nomake test core`, each with a timeout from its [test] table, default 60s). compile_commands.json
+    and the solution are written at the root.
 
 OPTIONS:
     -r, --release   Optimised build
@@ -128,12 +138,20 @@ fn real_main() -> Result<i32> {
         return Ok(0);
     };
     let args = parse(argv.collect())?;
+    let here = util::absolute(std::path::Path::new("."));
+    let workspace = match command.as_str() {
+        "build" | "b" | "run" | "r" | "test" | "t" | "clean" | "compdb" | "vs" => workspace::find(&here)?,
+        _ => None,
+    };
     if command == "vs" {
         let archs = if args.archs.is_empty() {
             vec![Arch::host()]
         } else {
             args.archs
         };
+        if let Some(root) = &workspace {
+            return workspace::solution(root, &archs).map(|_| 0);
+        }
         return toolchain::vs::generate(&archs).map(|_| 0);
     }
     let arch = single_arch(&args)?;
@@ -143,15 +161,28 @@ fn real_main() -> Result<i32> {
         jobs: args.jobs,
         verbose: args.verbose,
         debug: args.debug,
+        roots: Vec::new(),
+        refresh_compdb: true,
     };
+    if let Some(root) = &workspace {
+        let config = (!args.archs.is_empty() || args.release).then_some((arch, args.release));
+        return match command.as_str() {
+            "build" | "b" => workspace::build(root, &args.positional, opts),
+            "run" | "r" => workspace::run(root, &args.positional, opts, &args.rest),
+            "test" | "t" => workspace::test(root, &args.positional, opts, &args.rest),
+            "clean" => commands::clean(config).map(|_| 0),
+            _ => workspace::compdb(root, arch, args.release).map(|_| 0),
+        };
+    }
     match command.as_str() {
         "build" | "b" => Ok(if commands::build(&opts)?.ok { 0 } else { 1 }),
-        "run" | "r" => commands::run(&opts, &args.rest),
+        "run" | "r" => commands::run(&opts, &args.rest, None),
+        "test" | "t" => commands::test(opts, &args.rest),
         "clean" => {
             let config = (!args.archs.is_empty() || args.release).then_some((arch, args.release));
             commands::clean(config).map(|_| 0)
         }
-        "compdb" => commands::compdb(arch, args.release).map(|_| 0),
+        "compdb" => commands::compdb(arch, args.release, &[]).map(|_| 0),
         "init" => init::init(args.yes, args.kind).map(|_| 0),
         "configure" => init::configure().map(|_| 0),
         "add" | "update" | "list" | "search" | "info" | "cache" => {

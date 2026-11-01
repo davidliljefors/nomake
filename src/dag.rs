@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use crate::config::{Generate, Kind};
+use crate::config::{Crt, Generate, Kind};
 use crate::scanner::{Pkg, Workspace};
 use crate::toolchain::{CompileSpec, Family, LinkSpec, Pch, Toolchain};
 use crate::util::{self, rel_str};
@@ -41,8 +41,8 @@ pub struct CompileCfg {
     defines: Vec<String>,
     flags: Vec<String>,
     release: bool,
-    /// Compiled without the C runtime.
-    freestanding: bool,
+    /// How the C runtime is linked.
+    crt: Crt,
     /// (header name as included, precompiled output) that C++ sources use.
     pch: Option<(String, PathBuf)>,
     /// Hash of the command line with the per-file parts blanked out.
@@ -67,7 +67,7 @@ impl CompileCfg {
             defines: &self.defines,
             flags: &self.flags,
             release: self.release,
-            freestanding: self.freestanding,
+            crt: self.crt,
             pch: match &self.pch {
                 Some((name, file)) if !is_c => Pch::Use { name, file },
                 _ => Pch::None,
@@ -139,6 +139,8 @@ pub struct Graph {
     pub sys_includes: Vec<String>,
     pub root_dir: PathBuf,
     pub target: PathBuf,
+    /// Each root package's folder and the file it builds, in the order the roots were given.
+    pub targets: Vec<(PathBuf, PathBuf)>,
 }
 
 struct Built {
@@ -147,12 +149,16 @@ struct Built {
     artifact: Option<(usize, PathBuf)>,
 }
 
-/// Packages linked into `pkg_idx`. A shared library carries its own dependencies, so the search stops there.
+/// Packages linked into `pkg_idx`. A shared library carries its own dependencies, so the search stops there;
+/// an executable dependency (a tool) is never linked.
 fn closure(ws: &Workspace, pkg_idx: usize) -> Vec<usize> {
     let mut seen = BTreeSet::new();
     let mut stack = vec![pkg_idx];
     while let Some(current) = stack.pop() {
         for &dep in &ws.pkgs[current].deps {
+            if ws.pkgs[dep].kind == Kind::Executable {
+                continue;
+            }
             if seen.insert(dep) && ws.pkgs[dep].kind != Kind::Shared {
                 stack.push(dep);
             }
@@ -161,10 +167,11 @@ fn closure(ws: &Workspace, pkg_idx: usize) -> Vec<usize> {
     seen.into_iter().collect()
 }
 
-/// Packages whose headers and defines `pkg_idx` sees: its direct dependencies plus whatever those re-export.
+/// Packages whose headers and defines `pkg_idx` sees: its direct dependencies and peers plus whatever those re-export.
 fn visible(ws: &Workspace, pkg_idx: usize) -> Vec<usize> {
     let mut seen = BTreeSet::new();
     let mut stack: Vec<usize> = ws.pkgs[pkg_idx].deps.clone();
+    stack.extend(&ws.pkgs[pkg_idx].peers);
     while let Some(current) = stack.pop() {
         if seen.insert(current) {
             stack.extend(&ws.pkgs[current].reexports);
@@ -224,9 +231,35 @@ struct GenOutput {
 }
 
 /// Expands each `[[generate]]` step into one node per matched input. Steps may consume outputs of earlier steps.
-fn generate_nodes(pkg: &Pkg, gen_dir: &Path, nodes: &mut Vec<Node>) -> Result<Vec<GenOutput>> {
+fn generate_nodes(
+    ws: &Workspace,
+    pkg_idx: usize,
+    built: &[Built],
+    includes: &[PathBuf],
+    out_dir: &Path,
+    nodes: &mut Vec<Node>,
+) -> Result<Vec<GenOutput>> {
+    let pkg = &ws.pkgs[pkg_idx];
+    let gen_dir = out_dir.join("gen").join(&pkg.name);
     let mut produced: Vec<GenOutput> = Vec::new();
     for step in &pkg.generate {
+        let tool = match &step.tool {
+            Some(name) => {
+                let found = pkg
+                    .deps
+                    .iter()
+                    .find(|&&dep| ws.pkgs[dep].name == *name && ws.pkgs[dep].kind == Kind::Executable)
+                    .and_then(|&dep| built[dep].artifact.clone());
+                match found {
+                    Some(artifact) => Some(artifact),
+                    None => bail!(
+                        "[[generate]] in '{}': tool '{name}' must be an executable in [dependencies]",
+                        pkg.name
+                    ),
+                }
+            }
+            None => None,
+        };
         let mut inputs: Vec<(Option<PathBuf>, Option<usize>)> = Vec::new();
         if step.inputs.is_empty() {
             inputs.push((None, None));
@@ -247,7 +280,7 @@ fn generate_nodes(pkg: &Pkg, gen_dir: &Path, nodes: &mut Vec<Node>) -> Result<Ve
         if inputs.is_empty() {
             bail!(
                 "[[generate]] '{}' in '{}' matched no inputs",
-                step.name,
+                step.label(),
                 pkg.name
             );
         }
@@ -263,9 +296,9 @@ fn generate_nodes(pkg: &Pkg, gen_dir: &Path, nodes: &mut Vec<Node>) -> Result<Ve
 
         let mut step_outputs = Vec::new();
         for run in runs {
-            let node = step_node(pkg, step, gen_dir, run);
+            let node = step_node(pkg, step, &gen_dir, run, tool.as_ref(), includes);
             for out in &node.outputs {
-                step_outputs.push((out.clone(), rel_str(gen_dir, out)));
+                step_outputs.push((out.clone(), rel_str(&gen_dir, out)));
             }
             let idx = push(nodes, node);
             for (path, rel) in step_outputs.drain(..) {
@@ -285,13 +318,15 @@ fn step_node(
     step: &Generate,
     gen_dir: &Path,
     run: Vec<(Option<PathBuf>, Option<usize>)>,
+    tool: Option<&(usize, PathBuf)>,
+    includes: &[PathBuf],
 ) -> Node {
     let input = run.first().and_then(|(path, _)| path.clone());
-    let producers: Vec<usize> = run.iter().filter_map(|(_, producer)| *producer).collect();
-    let all_inputs: Vec<PathBuf> = run.into_iter().filter_map(|(path, _)| path).collect();
+    let mut producers: Vec<usize> = run.iter().filter_map(|(_, producer)| *producer).collect();
+    let mut all_inputs: Vec<PathBuf> = run.into_iter().filter_map(|(path, _)| path).collect();
     let stem = match &input {
         Some(path) => path.file_stem().unwrap().to_string_lossy().into_owned(),
-        None => step.name.clone(),
+        None => step.label().to_string(),
     };
     let outputs: Vec<PathBuf> = step
         .outputs
@@ -302,31 +337,59 @@ fn step_node(
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let depfile = gen_dir.join(format!("{stem}.{}.d", step.label()));
     let subst = |arg: &String| {
         arg.replace("{input}", &input_str)
             .replace("{output}", &outputs[0].to_string_lossy())
             .replace("{out_dir}", &gen_dir.to_string_lossy())
             .replace("{stem}", &stem)
+            .replace("{depfile}", &depfile.to_string_lossy())
     };
-    let args: Vec<String> = step.command[1..].iter().map(subst).collect();
+    let (program, args, dep_style) = match tool {
+        Some((node, path)) => {
+            producers.push(*node);
+            all_inputs.push(path.clone());
+            let mut args = vec![
+                "--out-dir".to_string(),
+                gen_dir.to_string_lossy().into_owned(),
+                "--depfile".to_string(),
+                depfile.to_string_lossy().into_owned(),
+            ];
+            args.extend(includes.iter().map(|dir| format!("-I{}", dir.display())));
+            args.push(input_str.clone());
+            (path.clone(), args, DepStyle::Gcc(depfile))
+        }
+        None => {
+            let uses_depfile = step.command.iter().any(|arg| arg.contains("{depfile}"));
+            (
+                PathBuf::from(&step.command[0]),
+                step.command[1..].iter().map(subst).collect(),
+                if uses_depfile {
+                    DepStyle::Gcc(depfile)
+                } else {
+                    DepStyle::None
+                },
+            )
+        }
+    };
     Node {
         kind: NodeKind::Generate,
         desc: format!(
             "GEN {} {}",
-            step.name,
+            step.label(),
             input
                 .as_ref()
                 .map_or(String::new(), |path| rel_str(&pkg.root, path))
         ),
-        program: PathBuf::from(&step.command[0]),
+        program,
         args: Args::Fixed(args),
         cwd: pkg.root.clone(),
         inputs: all_inputs,
         outputs,
         deps: edges(producers, []),
-        dep_style: DepStyle::None,
+        dep_style,
         rm_outputs: false,
-        cutoff: false,
+        cutoff: true,
         hash: 0,
     }
 }
@@ -371,12 +434,14 @@ pub fn build(
     let mut built: Vec<Built> = Vec::new();
     let tc_arc = Arc::new(tc.clone());
     let obj_ext = if tc.msvc_style() { "obj" } else { "o" };
+    let crt = ws.crt()?;
 
     for (pkg_idx, pkg) in ws.pkgs.iter().enumerate() {
         let deps = closure(ws, pkg_idx);
         let gen_dir = out_dir.join("gen").join(&pkg.name);
+        let (includes, defines) = compile_scope(ws, pkg_idx, &out_dir.join("gen"));
 
-        let produced = generate_nodes(pkg, &gen_dir, &mut nodes)?;
+        let produced = generate_nodes(ws, pkg_idx, &built, &includes, out_dir, &mut nodes)?;
         let mut gens: Vec<usize> = produced.iter().map(|output| output.node).collect();
         gens.dedup();
 
@@ -389,11 +454,9 @@ pub fn build(
                     .iter()
                     .flat_map(|&dep| built[dep].gens.clone()),
             )
-            .collect();
+            .collect(            );
 
-        let (includes, defines) = compile_scope(ws, pkg_idx, &out_dir.join("gen"));
-
-        let mut sources: Vec<(PathBuf, Option<usize>)> = pkg
+            let mut sources: Vec<(PathBuf, Option<usize>)> = pkg
             .sources
             .iter()
             .map(|path| (path.clone(), None))
@@ -440,7 +503,7 @@ pub fn build(
             defines,
             flags: pkg.flags.clone(),
             release,
-            freestanding: !pkg.crt,
+            crt,
             pch: pch.clone(),
             hash: 0,
         };
@@ -620,8 +683,7 @@ pub fn build(
                         sys_libs: &sys_libs,
                         flags: &flags,
                         release,
-                        crt: pkg.crt,
-                        entry: pkg.entry.as_deref(),
+                        crt,
                         subsystem: pkg.subsystem.as_deref(),
                     })),
                     cwd: root_dir.to_path_buf(),
@@ -650,6 +712,14 @@ pub fn build(
 
     let root = ws.root();
     let target = out_dir.join(tc.artifact(root.kind, &root.name).0);
+    let targets = ws
+        .roots
+        .iter()
+        .map(|&idx| {
+            let pkg = &ws.pkgs[idx];
+            (pkg.root.clone(), out_dir.join(tc.artifact(pkg.kind, &pkg.name).0))
+        })
+        .collect();
 
     let mut dependents = vec![Vec::new(); nodes.len()];
     for (idx, node) in nodes.iter().enumerate() {
@@ -665,6 +735,7 @@ pub fn build(
         sys_includes: tc.system_includes(),
         root_dir: root_dir.to_path_buf(),
         target,
+        targets,
     })
 }
 
@@ -711,6 +782,67 @@ mod tests {
             3,
             "linking still sees every dependency"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tool_steps_run_the_built_tool_per_input_and_are_not_linked() {
+        let root = std::env::temp_dir().join(format!("nomake_tool_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for dir in ["tool", "app/data"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(
+            root.join("tool/nomake.toml"),
+            "[package]\nname = \"tool\"\ntype = \"executable\"\n[sources]\nfiles = [\"main.cpp\"]\n",
+        )
+        .unwrap();
+        fs::write(root.join("tool/main.cpp"), "").unwrap();
+        fs::write(
+            root.join("app/nomake.toml"),
+            "[package]\nname = \"app\"\ntype = \"executable\"\n[sources]\nfiles = [\"main.cpp\"]\n\
+             [dependencies]\ntool = { path = \"../tool\" }\n\
+             [[generate]]\ntool = \"tool\"\ninputs = [\"data/*.x\"]\noutputs = [\"{stem}.gen.cpp\"]\n",
+        )
+        .unwrap();
+        fs::write(root.join("app/main.cpp"), "").unwrap();
+        fs::write(root.join("app/data/a.x"), "").unwrap();
+        fs::write(root.join("app/data/b.x"), "").unwrap();
+
+        let ws = crate::scanner::load(&root.join("app")).unwrap();
+        let clang = Toolchain::for_tests(crate::toolchain::Family::Clang);
+        let graph = build(&ws, &clang, false, &root, &root.join("build")).unwrap();
+
+        let gens: Vec<&Node> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Generate)
+            .collect();
+        assert_eq!(gens.len(), 2, "one run per matched input");
+        let tool_link = graph
+            .nodes
+            .iter()
+            .position(|node| node.desc == "LINK tool")
+            .unwrap();
+        for node in &gens {
+            let args = node.args().join(" ");
+            assert!(args.contains("--out-dir") && args.contains("--depfile"));
+            assert!(node.deps.iter().any(|edge| edge.node == tool_link));
+            assert!(matches!(node.dep_style, DepStyle::Gcc(_)));
+        }
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.desc.starts_with("CXX") && node.desc.ends_with("b.gen.cpp")));
+        let link = graph
+            .nodes
+            .iter()
+            .find(|node| node.desc == "LINK app")
+            .unwrap();
+        assert!(link
+            .inputs
+            .iter()
+            .all(|input| !input.to_string_lossy().contains("tool.exe") && input.file_stem().unwrap() != "tool"));
         fs::remove_dir_all(root).unwrap();
     }
 

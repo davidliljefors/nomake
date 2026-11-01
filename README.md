@@ -89,7 +89,7 @@ public_defines = ["USE_FOO"]    # also applied to dependents
 flags = ["-Wall"]
 link_flags = []
 libs = ["user32"]
-crt = true    # false builds without the C runtime
+crt = "dynamic"    # or "static"; one value for the whole build
 
 [toolchain]
 cxx = "clang++"
@@ -111,7 +111,21 @@ Dependencies build first, and their static libraries, system libraries and link 
 
 ### Generated files
 
-`[[generate]]` runs `command` once per matched input, or once for all of them with `batch = true` (`{input}` is then the first). Placeholders: `{input}`, `{output}`, `{out_dir}`, `{stem}`. Outputs go to `build/<arch>-<profile>/gen/<package>/`, which is added to the include path, and generated `.cpp` files are compiled. Later steps can use earlier outputs as inputs.
+`[[generate]]` runs `command` once per matched input, or once for all of them with `batch = true` (`{input}` is then the first). Placeholders: `{input}`, `{output}`, `{out_dir}`, `{stem}`, `{depfile}`. Outputs go to `build/<arch>-<profile>/gen/<package>/`, which is added to the include path, and generated `.cpp` files are compiled. Later steps can use earlier outputs as inputs.
+
+A step can name a `tool` instead of a `command`: an executable package from `[dependencies]`, built first and never linked.
+
+```toml
+[dependencies]
+my-gen = { path = "../my-gen" }
+
+[[generate]]
+tool = "my-gen"
+inputs = ["schema/*.in"]
+outputs = ["{stem}.gen.hpp", "{stem}.gen.cpp"]
+```
+
+Each input runs `tool --out-dir <gen dir> --depfile <file> -I<dir>... <input>`, where the `-I` dirs are the include directories the package sees. The tool writes a Makefile-style depfile (`out: dep dep ...`) naming every other file it read, such as imports, so the step reruns when they change. With `command`, put `{depfile}` in the arguments to opt in. Rebuilding the tool reruns its steps. Like a compiler, a tool must write its outputs on every run.
 
 ### Platform tables
 
@@ -135,7 +149,7 @@ A target table takes `sources`, `include`, `build` and `dependencies`. A depende
 
 ### Features
 
-A feature adds `sources`, `include` and `build` settings when on. It can't add dependencies.
+A feature adds `sources`, `include` and `build` settings when on. It can't add dependencies, but `peer = ["sdl3"]` makes the package compile against the headers and defines of a dependency the root project already lists, without linking it. A missing peer is an error.
 
 ```toml
 [features]
@@ -162,18 +176,17 @@ Features work on `path` dependencies too. Features requested by different depend
 
 ### Raw flags
 
-`flags` go to the compiler driver. `link_flags` go to the linker (`lld-link` or `link.exe` on Windows with clang or cl, so `/nodefaultlib`, not `-nostdlib`) or to the driver where there is no separate linker. Both come last and can override what nomake adds.
+`flags` go to the compiler driver. `link_flags` go to the linker (`lld-link` or `link.exe` on Windows with clang or cl) or to the driver where there is no separate linker. Both come last and can override what nomake adds.
 
-### No C runtime
+### C runtime
 
 ```toml
 [build]
-crt = false
-entry = "start"    # entry symbol, for executables and shared libraries
+crt = "dynamic"    # default; or "static"
 subsystem = "console"    # or "windows", link.exe and lld-link only
 ```
 
-`crt = false` compiles the package freestanding (`-ffreestanding -fno-stack-protector -funwind-tables`, or `/GS- /Zl` and no `/MD` for cl). When that package is linked it also drops the default libraries. Libraries in `libs` are still linked. It's per package, so a static library with `crt = false` can go into a program that uses the runtime.
+On Windows `dynamic` is `/MD` (`/MDd` in debug builds, `-fms-runtime-lib=dll` for clang) and `static` is `/MT`. Objects name the runtime they were compiled for, so nomake drops the driver's own default pick from the link. With `static` on Linux, executables link with `-static`; macOS always links libSystem dynamically. One process needs one runtime, so every package in a build must agree: a package that sets a different `crt` than another is an error.
 
 ## Registry
 
@@ -202,7 +215,19 @@ A recipe can offer both builds with `type = ["shared", "static"]` (first is the 
 
 ## Visual Studio
 
-`nomake vs` writes `build/vs/<name>.sln` with Debug and Release for the host architecture. `-a` picks others, comma separated or repeated (`nomake vs -a x64,arm64`). Platforms are named `x64`, `Win32` and `ARM64`. They are NMake projects: Visual Studio browses and edits, build and debug call back into nomake.
+`nomake vs` writes `build/vs/<name>.sln` with Debug and Release for the host architecture. `-a` picks others, comma separated or repeated (`nomake vs -a x64,arm64`). Platforms are named `x64`, `Win32` and `ARM64`. They are NMake projects: Visual Studio browses and edits, build and debug call back into nomake. In a workspace the solution has one project per member, programs first (Visual Studio starts the first one; change it with Set as Startup Project).
+
+## Workspaces
+
+A folder whose `nomake.toml` has a `[workspace]` table groups several packages:
+
+```toml
+[workspace]
+members = ["xdlib", "xdlib/tests", "tools/*"]   # a trailing /* takes every subfolder with a nomake.toml
+```
+
+`build`, `run`, `clean`, `compdb` and `vs` at the root act on every member. Name members to pick some (`nomake build app tests`, `nomake run app`; `run` needs a name when several members are programs, and runs it from the member's folder). All members load as one set of packages and build as one graph into the root's `build/`, so a shared dependency compiles once and members build in parallel. Like Cargo, a shared dependency gets the union of the features its dependents ask for, and they must agree on static or shared (set `link` in a member to choose). `clean` removes the root's `build/`. The root gets one `compile_commands.json` (`nomake compdb`, then kept current by a full `nomake build`) and one solution. A root that also has a `[package]` is a member itself. Without `[workspace]` nothing changes.
+
 
 ## Examples
 

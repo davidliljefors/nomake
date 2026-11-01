@@ -4,11 +4,12 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::compdb;
-use crate::config::Kind;
+use crate::config::{Kind, Manifest};
 use crate::dag::{self, Graph};
 use crate::executor;
 use crate::scanner;
 use crate::state::State;
+use crate::testrun::{self, Test};
 use crate::toolchain::{Arch, Toolchain};
 use crate::util::absolute;
 use crate::Result;
@@ -19,11 +20,16 @@ pub struct BuildOpts {
     pub jobs: Option<usize>,
     pub verbose: bool,
     pub debug: executor::Debug,
+    /// Package folders to build together; empty means the package in the current directory.
+    pub roots: Vec<PathBuf>,
+    /// Keep an existing compile_commands.json current; off when only some of a workspace is built.
+    pub refresh_compdb: bool,
 }
 
 pub struct Built {
     pub ok: bool,
     pub target: PathBuf,
+    pub targets: Vec<(PathBuf, PathBuf)>,
     pub kind: Kind,
 }
 
@@ -45,9 +51,18 @@ fn compdb_stamp(root_dir: &Path) -> PathBuf {
     root_dir.join("build").join(".nomake_compdb")
 }
 
-fn plan(arch: Arch, release: bool) -> Result<(scanner::Workspace, Toolchain, Graph)> {
+/// Plans the build of `roots` (the current directory's package when empty) in the current directory's build/.
+fn plan(
+    arch: Arch,
+    release: bool,
+    roots: &[PathBuf],
+) -> Result<(scanner::Workspace, Toolchain, Graph)> {
     let root_dir = absolute(Path::new("."));
-    let ws = scanner::load(&root_dir)?;
+    let ws = if roots.is_empty() {
+        scanner::load(&root_dir)?
+    } else {
+        scanner::load_roots(&root_dir, roots)?
+    };
     let tc = Toolchain::detect(&ws.root().toolchain, arch, &root_dir.join("build"))?;
     let graph = dag::build(
         &ws,
@@ -73,7 +88,7 @@ pub fn build(opts: &BuildOpts) -> Result<Built> {
     let dir = out_dir(&root_dir, opts.arch, opts.release);
     // The state file is independent of the plan, so the two load side by side.
     let (planned, state) = rayon::join(
-        || plan(opts.arch, opts.release),
+        || plan(opts.arch, opts.release, &opts.roots),
         || -> Result<State> {
             fs::create_dir_all(&dir)?;
             State::open(&dir.join(".nomake_state"))
@@ -81,16 +96,25 @@ pub fn build(opts: &BuildOpts) -> Result<Built> {
     );
     let (ws, tc, graph) = planned?;
     let state = state?;
-    compdb::refresh(&graph, &compdb_stamp(&root_dir))?;
+    if opts.refresh_compdb {
+        compdb::refresh(&graph, &compdb_stamp(&root_dir))?;
+    }
     let jobs = opts
         .jobs
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |count| count.get()));
 
     let root = ws.root();
+    let title = if ws.roots.len() > 1 {
+        format!(
+            "workspace {} ({} packages)",
+            root_dir.file_name().unwrap_or_default().to_string_lossy(),
+            ws.roots.len()
+        )
+    } else {
+        format!("{} v{}", root.name, root.version)
+    };
     println!(
-        "nomake: {} v{} [{} {}] with {}",
-        root.name,
-        root.version,
+        "nomake: {title} [{} {}] with {}",
         opts.arch.name(),
         profile(opts.release),
         tc.cxx.file_name().unwrap().to_string_lossy()
@@ -109,16 +133,37 @@ pub fn build(opts: &BuildOpts) -> Result<Built> {
     }
     let kind = root.kind;
     let target = graph.target.clone();
+    let targets = graph.targets.clone();
     // Freeing 10k nodes is pure latency; let it overlap the exit or the program `run` starts.
     std::thread::spawn(move || drop((graph, ws)));
     Ok(Built {
         ok: summary.ok,
         target,
+        targets,
         kind,
     })
 }
 
-pub fn run(opts: &BuildOpts, args: &[String]) -> Result<i32> {
+/// Builds and runs the test package in the current directory.
+pub fn test(opts: BuildOpts, extra: &[String]) -> Result<i32> {
+    let dir = absolute(Path::new("."));
+    let manifest = Manifest::load_resolved(&dir.join("nomake.toml"))?;
+    if !manifest.package.is_test() {
+        bail!(
+            "package '{}' is not a test (set type = \"test\")",
+            manifest.package.name
+        );
+    }
+    let test = Test {
+        name: manifest.package.name.clone(),
+        dir,
+        config: manifest.test.clone(),
+    };
+    testrun::run(opts, &[test], extra)
+}
+
+/// Builds and runs the executable, from `cwd` when given (the package's folder, in a workspace).
+pub fn run(opts: &BuildOpts, args: &[String], cwd: Option<&Path>) -> Result<i32> {
     let built = build(opts)?;
     if !built.ok {
         return Ok(1);
@@ -126,7 +171,12 @@ pub fn run(opts: &BuildOpts, args: &[String]) -> Result<i32> {
     if built.kind != Kind::Executable {
         bail!("package is not an executable");
     }
-    let status = Command::new(&built.target).args(args).status()?;
+    let mut command = Command::new(&built.target);
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let status = command.status()?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -163,8 +213,8 @@ pub fn clean(config: Option<(Arch, bool)>) -> Result<()> {
     Ok(())
 }
 
-pub fn compdb(arch: Arch, release: bool) -> Result<()> {
-    let (_, _, graph) = plan(arch, release)?;
+pub fn compdb(arch: Arch, release: bool, roots: &[PathBuf]) -> Result<()> {
+    let (_, _, graph) = plan(arch, release, roots)?;
     let count = compdb::generate(&graph, &compdb_stamp(&graph.root_dir))?;
     println!("nomake: wrote compile_commands.json ({count} entries)");
     Ok(())
@@ -178,6 +228,7 @@ pub fn new(name: &str, kind: Kind) -> Result<()> {
     fs::create_dir_all(dir.join("src"))?;
     let kind_str = match kind {
         Kind::Executable => "executable",
+        Kind::Test => "test",
         Kind::Static => "static",
         Kind::Shared => "shared",
     };

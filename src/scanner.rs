@@ -24,40 +24,68 @@ pub struct Pkg {
     pub pch: Option<PathBuf>,
     pub link_flags: Vec<String>,
     pub libs: Vec<String>,
-    pub crt: bool,
-    pub entry: Option<String>,
+    pub crt: Option<crate::config::Crt>,
     pub subsystem: Option<String>,
     pub generate: Vec<crate::config::Generate>,
     /// Indices into `Workspace::pkgs`; always lower than this package's own index.
     pub deps: Vec<usize>,
     /// The subset of `deps` marked `public = true`.
     pub reexports: Vec<usize>,
+    /// Packages from the root project's dependencies that this package's headers and defines come from, without linking or depending on them.
+    pub peers: Vec<usize>,
     pub toolchain: Toolchain,
 }
 
-/// Packages in dependency order; the last one is the root.
+/// Packages in dependency order. `roots` are the packages that were asked for (one, or every workspace member).
 pub struct Workspace {
     pub pkgs: Vec<Pkg>,
+    pub roots: Vec<usize>,
 }
 
 impl Workspace {
+    /// The package a single-root build is about; in a workspace, the first member.
     pub fn root(&self) -> &Pkg {
-        self.pkgs.last().unwrap()
+        &self.pkgs[self.roots[0]]
+    }
+
+    /// The one C runtime mode the whole build uses; packages that name one must agree.
+    pub fn crt(&self) -> Result<crate::config::Crt> {
+        let mut chosen: Option<(&str, crate::config::Crt)> = None;
+        for pkg in &self.pkgs {
+            let Some(mode) = pkg.crt else { continue };
+            match chosen {
+                Some((first, other)) if other != mode => bail!(
+                    "crt: '{first}' wants {} but '{}' wants {}; one build uses one runtime",
+                    other.name(),
+                    pkg.name,
+                    mode.name()
+                ),
+                Some(_) => {}
+                None => chosen = Some((&pkg.name, mode)),
+            }
+        }
+        Ok(chosen.map_or_else(Default::default, |(_, mode)| mode))
     }
 }
 
 pub fn load(root: &Path) -> Result<Workspace> {
-    load_with(root, None)
+    load_roots(root, std::slice::from_ref(&root.to_path_buf()))
+}
+
+/// Loads several root packages into one set of packages, so a shared dependency exists once with the
+/// features and link kind every member asks for. The lock file lives in `lock_dir`.
+pub fn load_roots(lock_dir: &Path, roots: &[PathBuf]) -> Result<Workspace> {
+    load_with(lock_dir, roots, None)
 }
 
 /// Re-resolves registry dependencies against the newest registry (all of them when `names` is empty) and rewrites `nomake.lock`.
 pub fn update(root: &Path, names: &[String]) -> Result<()> {
-    load_with(root, Some(names)).map(|_| ())
+    load_with(root, std::slice::from_ref(&root.to_path_buf()), Some(names)).map(|_| ())
 }
 
-fn load_with(root: &Path, update: Option<&[String]>) -> Result<Workspace> {
-    let mut resolver = registry::Resolver::new(root, update)?;
-    let (manifests, links) = read_manifests(root, &mut resolver)?;
+fn load_with(lock_dir: &Path, roots: &[PathBuf], update: Option<&[String]>) -> Result<Workspace> {
+    let mut resolver = registry::Resolver::new(lock_dir, update)?;
+    let (manifests, links) = read_manifests(roots, &mut resolver)?;
     resolver.fetch()?;
     resolver.save()?;
     let mut loader = Loader {
@@ -67,8 +95,12 @@ fn load_with(root: &Path, update: Option<&[String]>) -> Result<Workspace> {
         cfgs: Vec::new(),
         done: HashMap::new(),
         stack: Vec::new(),
+        roots: roots.to_vec(),
     };
-    loader.load(root)?;
+    let mut root_indices = Vec::new();
+    for root in roots {
+        root_indices.push(loader.load(root)?);
+    }
     let Loader { mut pkgs, cfgs, .. } = loader;
     pkgs.par_iter_mut()
         .zip(cfgs)
@@ -79,7 +111,10 @@ fn load_with(root: &Path, update: Option<&[String]>) -> Result<Workspace> {
             bail!("two packages are named '{}' (two versions of one registry dependency? pin it in the root nomake.toml)", pkg.name);
         }
     }
-    Ok(Workspace { pkgs })
+    Ok(Workspace {
+        pkgs,
+        roots: root_indices,
+    })
 }
 
 /// (package that lists the dependency, dependency key) -> the dependency's package root.
@@ -107,18 +142,21 @@ fn locate(
     }
 }
 
-/// Reads every manifest reachable from `root`, one dependency level at a time, each level in parallel.
-/// Versions listed in the root manifest override what other packages ask for.
+/// Reads every manifest reachable from `roots`, one dependency level at a time, each level in parallel.
+/// Versions listed in a root manifest override what other packages ask for.
 fn read_manifests(
-    root: &Path,
+    roots: &[PathBuf],
     resolver: &mut registry::Resolver,
 ) -> Result<(HashMap<PathBuf, Manifest>, Links)> {
     let mut all = HashMap::new();
     let mut links = Links::new();
     let mut wanted: HashMap<PathBuf, Wanted> = HashMap::new();
     let mut pins: HashMap<String, String> = HashMap::new();
-    let mut seen = HashSet::from([root.to_path_buf()]);
-    let mut level = vec![(root.to_path_buf(), root.join("nomake.toml"))];
+    let mut seen: HashSet<PathBuf> = roots.iter().cloned().collect();
+    let mut level: Vec<(PathBuf, PathBuf)> = roots
+        .iter()
+        .map(|root| (root.clone(), root.join("nomake.toml")))
+        .collect();
     while !level.is_empty() {
         let read = level
             .into_par_iter()
@@ -134,28 +172,35 @@ fn read_manifests(
             })
             .collect::<Result<Vec<_>>>()?;
         level = Vec::new();
-        for (dir, manifest) in read {
-            if dir == root {
-                pins = manifest
-                    .dependencies
-                    .iter()
-                    .filter_map(|(key, dep)| Some((key.clone(), dep.version.clone()?)))
-                    .collect();
+        // Every root's pins have to be known before any dependency is located.
+        for (dir, manifest) in &read {
+            if roots.contains(dir) {
+                pins.extend(
+                    manifest
+                        .dependencies
+                        .iter()
+                        .filter_map(|(key, dep)| Some((key.clone(), dep.version.clone()?))),
+                );
             }
+        }
+        for (dir, manifest) in read {
+            let from_root = roots.contains(&dir);
             for (key, dep) in &manifest.dependencies {
                 let (dep_dir, file) = locate(&dir, key, dep, &pins, resolver)?;
                 if seen.insert(dep_dir.clone()) {
                     level.push((dep_dir.clone(), file));
                 }
                 links.insert((dir.clone(), key.clone()), dep_dir.clone());
-                wanted.entry(dep_dir).or_default().add(dep, dir == root);
+                wanted.entry(dep_dir).or_default().add(dep, from_root);
             }
             all.insert(dir, manifest);
         }
     }
     // Features only add files and flags, never dependencies, so they can be switched on once every
     // dependent has been seen. A package's features are the union of what its dependents ask for.
-    wanted.entry(root.to_path_buf()).or_default().defaults = true;
+    for root in roots {
+        wanted.entry(root.clone()).or_default().defaults = true;
+    }
     for (dir, manifest) in &mut all {
         let features = wanted.remove(dir).unwrap_or_default();
         manifest.enable(&features.names, features.defaults)?;
@@ -211,6 +256,7 @@ struct Loader<'a> {
     cfgs: Vec<Sources>,
     done: HashMap<PathBuf, usize>,
     stack: Vec<PathBuf>,
+    roots: Vec<PathBuf>,
 }
 
 impl Loader<'_> {
@@ -233,6 +279,21 @@ impl Loader<'_> {
             if dep.public {
                 reexports.push(idx);
             }
+        }
+        let mut peers = Vec::new();
+        for key in &manifest.peers {
+            let Some(peer_dir) = self
+                .roots
+                .iter()
+                .find_map(|root| self.links.get(&(root.clone(), key.clone())))
+                .cloned()
+            else {
+                bail!(
+                    "package '{}' needs peer dependency '{key}'; add it to [dependencies] of the root nomake.toml",
+                    manifest.package.name
+                );
+            };
+            peers.push(self.load(&peer_dir)?);
         }
         self.stack.pop();
 
@@ -269,12 +330,12 @@ impl Loader<'_> {
             pch: manifest.build.pch.map(|path| dir.join(path)),
             link_flags: manifest.build.link_flags,
             libs: manifest.build.libs,
-            crt: manifest.build.crt.unwrap_or(true),
-            entry: manifest.build.entry,
+            crt: manifest.build.crt,
             subsystem: manifest.build.subsystem,
             generate: manifest.generate,
             deps,
             reexports,
+            peers,
             toolchain: manifest.toolchain,
         });
         self.done.insert(dir.to_path_buf(), idx);
@@ -392,6 +453,30 @@ mod tests {
         );
         write(&root, "app/nomake.toml", "[package]\nname = \"app\"\n[dependencies]\nlib = { path = \"../lib\", features = [\"nope\"] }\n");
         assert!(load(&root.join("app")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn feature_peers_come_from_the_root_dependencies() {
+        let root = std::env::temp_dir().join(format!("nomake_peers_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        write(&root, "sdl/nomake.toml", "[package]\nname = \"sdl\"\ntype = \"static\"\n[include]\npublic = [\"include\"]\n");
+        write(&root, "sdl/a.c", "");
+        write(&root, "ui/nomake.toml", "[package]\nname = \"ui\"\ntype = \"static\"\n[features]\ndefault = []\n[feature.sdl]\npeer = [\"sdl\"]\nsources.files = [\"b.c\"]\n");
+        write(&root, "ui/b.c", "");
+        write(&root, "app/main.c", "");
+        let app = |dependencies: &str| {
+            write(&root, "app/nomake.toml", &format!("[package]\nname = \"app\"\n[dependencies]\n{dependencies}"));
+            load(&root.join("app"))
+        };
+        let on = "ui = { path = \"../ui\", features = [\"sdl\"] }\n";
+        assert!(app(on).is_err());
+        let ws = app(&format!("sdl = {{ path = \"../sdl\" }}\n{on}")).unwrap();
+        let ui = ws.pkgs.iter().position(|p| p.name == "ui").unwrap();
+        let sdl = ws.pkgs.iter().position(|p| p.name == "sdl").unwrap();
+        assert!(sdl < ui && ws.pkgs[ui].peers == [sdl] && ws.pkgs[ui].deps.is_empty());
+        let ws = app("sdl = { path = \"../sdl\" }\nui = { path = \"../ui\" }\n").unwrap();
+        assert!(ws.pkgs.iter().all(|p| p.peers.is_empty()));
         fs::remove_dir_all(root).unwrap();
     }
 }

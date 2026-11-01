@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{self, Kind};
+use crate::config::{self, Crt, Kind};
 use crate::Result;
 
 mod flags;
@@ -117,7 +117,7 @@ pub struct CompileSpec<'a> {
     pub defines: &'a [String],
     pub flags: &'a [String],
     pub release: bool,
-    pub freestanding: bool,
+    pub crt: Crt,
     pub pch: Pch<'a>,
 }
 
@@ -143,9 +143,7 @@ pub struct LinkSpec<'a> {
     pub sys_libs: &'a [String],
     pub flags: &'a [String],
     pub release: bool,
-    /// Without the C runtime: nothing links by default.
-    pub crt: bool,
-    pub entry: Option<&'a str>,
+    pub crt: Crt,
     pub subsystem: Option<&'a str>,
 }
 
@@ -487,7 +485,7 @@ impl Toolchain {
     /// (file to produce, file other packages link against)
     pub fn artifact(&self, kind: Kind, name: &str) -> (String, String) {
         match kind {
-            Kind::Executable => {
+            Kind::Executable | Kind::Test => {
                 let file = if cfg!(windows) {
                     format!("{name}.exe")
                 } else {
@@ -565,18 +563,12 @@ impl Toolchain {
                 dialect.debug
             },
         );
-        if spec.freestanding {
-            flags::extend(&mut args, dialect.freestanding);
+        let table = if self.family == Family::Clang && cfg!(windows) {
+            &CLANG_WINDOWS_CRT
         } else {
-            flags::extend(
-                &mut args,
-                if spec.release {
-                    dialect.crt_release
-                } else {
-                    dialect.crt_debug
-                },
-            );
-        }
+            &dialect.crt
+        };
+        flags::extend(&mut args, table[crt_index(spec.crt, spec.release)]);
         flags::extend(&mut args, self.object_flags(spec.release));
         if !msvc && !spec.release && cfg!(target_os = "linux") {
             flags::extend(&mut args, SPLIT_DWARF);
@@ -637,12 +629,12 @@ impl Toolchain {
         };
         let mut args: Vec<String> = Vec::new();
         match &self.linker {
-            // The driver's own default libraries are the C runtime.
+            // The objects carry the runtime they were compiled for.
             Some(linker) => args.extend(
                 linker
                     .prefix
                     .iter()
-                    .filter(|word| spec.crt || !flags::is_default_lib(word))
+                    .filter(|word| !flags::is_runtime_lib(word))
                     .cloned(),
             ),
             None => args.extend(self.target_args.iter().cloned()),
@@ -667,17 +659,8 @@ impl Toolchain {
         args.extend(spec.objs.iter().map(|obj| path_string(obj)));
         args.extend(spec.libs.iter().map(|lib| path_string(lib)));
         args.extend(spec.sys_libs.iter().map(|name| (dialect.sys_lib)(name)));
-        if !spec.crt {
-            flags::extend(&mut args, dialect.no_default_libs);
-        }
-        if let (Some(opt), Some(entry)) = (dialect.entry, spec.entry) {
-            // Mach-O symbols carry a leading underscore.
-            let symbol = if cfg!(target_os = "macos") && self.linker.is_none() {
-                format!("_{entry}")
-            } else {
-                entry.to_string()
-            };
-            opt.push(&mut args, symbol);
+        if spec.crt == Crt::Static && spec.kind == Kind::Executable && !cfg!(target_os = "macos") {
+            flags::extend(&mut args, dialect.static_crt);
         }
         if let (Some(opt), Some(subsystem)) = (dialect.subsystem, spec.subsystem) {
             opt.push(&mut args, subsystem);
@@ -694,7 +677,7 @@ impl Toolchain {
 mod tests {
     use super::*;
 
-    fn compile(family: Family, freestanding: bool) -> String {
+    fn compile(family: Family, crt: Crt) -> String {
         let spec = CompileSpec {
             src: Path::new("a.c"),
             obj: Path::new("a.o"),
@@ -705,13 +688,13 @@ mod tests {
             defines: &["X=1".to_string()],
             flags: &[],
             release: false,
-            freestanding,
+            crt,
             pch: Pch::None,
         };
         Toolchain::for_tests(family).compile_args(&spec).join(" ")
     }
 
-    fn link(linker: Option<Vec<&str>>, crt: bool) -> String {
+    fn link(linker: Option<Vec<&str>>, crt: Crt) -> String {
         let mut tc = Toolchain::for_tests(Family::Clang);
         tc.linker = linker.map(|prefix| Linker {
             program: "lld-link".into(),
@@ -726,28 +709,25 @@ mod tests {
             flags: &["/raw".to_string()],
             release: true,
             crt,
-            entry: Some("start"),
             subsystem: Some("console"),
         })
         .join(" ")
     }
 
     #[test]
-    fn freestanding_drops_the_runtime_from_compile_flags() {
-        let msvc = compile(Family::Msvc, false);
-        assert!(msvc.contains("/MDd") && !msvc.contains("/Zl"));
-        let msvc = compile(Family::Msvc, true);
-        assert!(!msvc.contains("/MDd") && msvc.contains("/GS-") && msvc.contains("/Zl"));
+    fn crt_mode_picks_the_runtime_flag() {
+        let msvc = compile(Family::Msvc, Crt::Dynamic);
+        assert!(msvc.contains("/MDd") && !msvc.contains("/MTd"));
+        let msvc = compile(Family::Msvc, Crt::Static);
+        assert!(msvc.contains("/MTd") && !msvc.contains("/MDd"));
 
-        let gnu = compile(Family::Gcc, false);
+        let gnu = compile(Family::Gcc, Crt::Dynamic);
         assert!(!gnu.contains("-ffreestanding") && gnu.contains("-MMD -MP -MF a.d"));
-        let gnu = compile(Family::Gcc, true);
-        assert!(gnu.contains("-ffreestanding") && gnu.contains("-funwind-tables"));
         assert!(gnu.contains("-Iinc") && gnu.contains("-DX=1") && gnu.contains("-o a.o"));
     }
 
     #[test]
-    fn crt_free_link_drops_default_libs_and_sets_entry() {
+    fn link_leaves_the_runtime_to_the_objects() {
         let driver_prefix = || {
             Some(vec![
                 "-defaultlib:libcmt",
@@ -755,19 +735,19 @@ mod tests {
                 "-defaultlib:oldnames",
             ])
         };
-        let with_crt = link(driver_prefix(), true);
-        assert!(with_crt.contains("-defaultlib:libcmt") && !with_crt.contains("NODEFAULTLIB"));
-
-        let without = link(driver_prefix(), false);
-        assert!(!without.contains("-defaultlib:") && without.contains("-libpath:x"));
-        assert!(without.contains("/NODEFAULTLIB") && without.contains("/ENTRY:start"));
-        assert!(without.contains("/SUBSYSTEM:console") && without.contains("kernel32.lib"));
+        let coff = link(driver_prefix(), Crt::Dynamic);
+        assert!(!coff.contains("libcmt") && coff.contains("-defaultlib:oldnames"));
+        assert!(coff.contains("-libpath:x") && coff.contains("/SUBSYSTEM:console"));
+        assert!(coff.contains("kernel32.lib") && !coff.contains("NODEFAULTLIB"));
         assert!(
-            without.ends_with("/raw"),
+            coff.ends_with("/raw"),
             "user flags come last so they can override"
         );
 
-        let gnu = link(None, false);
-        assert!(gnu.contains("-nostdlib") && gnu.contains("-Wl,-e,") && !gnu.contains("SUBSYSTEM"));
+        let gnu = link(None, Crt::Dynamic);
+        assert!(!gnu.contains("-static") && !gnu.contains("-nostdlib"));
+        if !cfg!(target_os = "macos") {
+            assert!(link(None, Crt::Static).contains("-static"));
+        }
     }
 }

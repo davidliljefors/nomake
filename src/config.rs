@@ -11,6 +11,8 @@ pub enum Kind {
     Executable,
     Static,
     Shared,
+    /// An executable that `nomake test` runs; the build treats it as `Executable`.
+    Test,
 }
 
 /// `cxx_standard = "20"` and `cxx_standard = 20` are both accepted.
@@ -34,6 +36,9 @@ impl Std {
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub package: Package,
+    /// Makes this folder the root of a workspace; read by `workspace::find`, which is lenient about the rest.
+    #[allow(dead_code)]
+    pub workspace: Option<WorkspaceDef>,
     #[serde(default)]
     pub sources: Sources,
     pub include: Option<Include>,
@@ -48,6 +53,9 @@ pub struct Manifest {
     /// Per-OS additions, applied by `resolve`; keyed by `windows`, `macos`, `linux` or `unix`.
     #[serde(default)]
     pub target: BTreeMap<String, Target>,
+    /// How `nomake test` runs a package of type `test`.
+    #[serde(default)]
+    pub test: TestConfig,
     /// Which features are on unless a dependent opts out.
     #[serde(default)]
     pub features: Features,
@@ -56,7 +64,30 @@ pub struct Manifest {
     pub feature: BTreeMap<String, Feature>,
     /// Present in registry recipes: where to fetch the package's sources.
     pub source: Option<Source>,
+    /// Dependency keys of the root project named by enabled features; filled in by `enable`.
+    #[serde(skip)]
+    pub peers: BTreeSet<String>,
 }
+
+/// `[workspace]`: package folders built together. An entry ending in `/*` takes every subfolder with a nomake.toml.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDef {
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
+/// `[test]`: how a package of type `test` is run. It passes when it exits with 0.
+#[derive(Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TestConfig {
+    /// Seconds before the run is killed and counted as failed (default 60).
+    pub timeout: Option<u64>,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+pub const DEFAULT_TEST_TIMEOUT: u64 = 60;
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -65,10 +96,13 @@ pub struct Features {
     pub default: Vec<String>,
 }
 
-/// What a `[feature.<name>]` table adds when the feature is on. Features cannot add dependencies.
+/// What a `[feature.<name>]` table adds when the feature is on. Features cannot add dependencies, but
+/// they can name peers: packages the root project depends on whose headers this package compiles against.
 #[derive(Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Feature {
+    #[serde(default)]
+    pub peer: Vec<String>,
     #[serde(default)]
     pub sources: Sources,
     pub include: Option<Include>,
@@ -138,20 +172,31 @@ impl Types {
 }
 
 impl Package {
-    /// What this package is built as: the dependents' choice, else the first listed type.
+    /// What this package is built as: the dependents' choice, else the first listed type. A test is an executable.
     pub fn kind(&self) -> Kind {
-        self.chosen.unwrap_or_else(|| {
+        let kind = self.chosen.unwrap_or_else(|| {
             self.types
                 .list()
                 .first()
                 .copied()
                 .unwrap_or(Kind::Executable)
-        })
+        });
+        if kind == Kind::Test {
+            Kind::Executable
+        } else {
+            kind
+        }
+    }
+
+    pub fn is_test(&self) -> bool {
+        self.types.list() == [Kind::Test]
     }
 
     fn check(&self) -> Result<()> {
         let kinds = self.types.list();
-        let libraries = kinds.iter().all(|kind| *kind != Kind::Executable);
+        let libraries = kinds
+            .iter()
+            .all(|kind| !matches!(kind, Kind::Executable | Kind::Test));
         let unique = kinds
             .iter()
             .enumerate()
@@ -194,6 +239,23 @@ pub struct Include {
     pub private: Vec<String>,
 }
 
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Crt {
+    #[default]
+    Dynamic,
+    Static,
+}
+
+impl Crt {
+    pub fn name(self) -> &'static str {
+        match self {
+            Crt::Dynamic => "dynamic",
+            Crt::Static => "static",
+        }
+    }
+}
+
 #[derive(Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Build {
@@ -207,13 +269,10 @@ pub struct Build {
     pub link_flags: Vec<String>,
     #[serde(default)]
     pub libs: Vec<String>,
-    /// `false` builds without the C runtime: freestanding compile flags, no default libraries at link time.
-    /// Only the package being linked decides the link; a static library with `crt = false` still links into
-    /// programs that use the runtime.
-    pub crt: Option<bool>,
-    /// Program entry symbol, used when this package is an executable or a shared library.
-    pub entry: Option<String>,
-    /// `console` or `windows`; COFF linkers only. Needed when `entry` replaces `main`.
+    /// How the C runtime is linked: `dynamic` (default) or `static`. One process needs one runtime, so every
+    /// package in a build has to agree.
+    pub crt: Option<Crt>,
+    /// `console` or `windows`; COFF linkers only.
     pub subsystem: Option<String>,
     /// Applied only when the package is built as a shared library, e.g. a `DLL_EXPORT` switch.
     #[serde(default)]
@@ -273,18 +332,53 @@ impl Source {
     }
 }
 
-/// One invocation of `command` per matched input; placeholders: {input} {output} {out_dir} {stem}.
+/// One invocation per matched input, of either `command` (placeholders: {input} {output} {out_dir} {stem}
+/// {depfile}) or `tool`, a dependency that is built first and called as
+/// `tool --out-dir <dir> --depfile <file> -I<include dir of each dependency>... <input>`.
+/// A tool writes a Makefile-style depfile naming every other file it read.
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Generate {
+    /// Names the step in build output; a tool step defaults to the tool's name.
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub tool: Option<String>,
     #[serde(default)]
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     /// Run once for all matched inputs instead of once per input.
     #[serde(default)]
     pub batch: bool,
+}
+
+impl Generate {
+    pub fn label(&self) -> &str {
+        match (&self.tool, self.name.is_empty()) {
+            (Some(tool), true) => tool,
+            _ => &self.name,
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        match (&self.tool, self.command.is_empty()) {
+            (Some(_), false) => bail!("[[generate]] takes either `tool` or `command`, not both"),
+            (None, true) => bail!("[[generate]] needs `tool` or `command`"),
+            _ => {}
+        }
+        if self.label().is_empty() {
+            bail!("[[generate]] with a command needs a `name`");
+        }
+        if self.outputs.is_empty() {
+            bail!("[[generate]] '{}' needs `outputs`", self.label());
+        }
+        if self.tool.is_some() && self.batch {
+            bail!("[[generate]] '{}': a tool step runs once per input", self.label());
+        }
+        Ok(())
+    }
 }
 
 impl Manifest {
@@ -375,6 +469,7 @@ impl Manifest {
             let Some(feature) = available.get(name) else {
                 bail!("package '{}' has no feature '{name}'", self.package.name);
             };
+            self.peers.extend(feature.peer.iter().cloned());
             add_sources(&mut self.sources, &feature.sources);
             add_include(&mut self.include, &feature.include);
             add_build(&mut self.build, &feature.build);
@@ -391,6 +486,7 @@ impl Manifest {
             add_sources(&mut feature.sources, &extra.sources);
             add_include(&mut feature.include, &extra.include);
             add_build(&mut feature.build, &extra.build);
+            feature.peer.extend(extra.peer.iter().cloned());
         }
         for (key, extra) in &target.dependencies {
             match self.dependencies.get_mut(key) {
@@ -427,14 +523,20 @@ impl Manifest {
 
     fn check(&self) -> Result<()> {
         self.package.check()?;
+        if !self.package.is_test() && (self.test.timeout.is_some() || !self.test.args.is_empty()) {
+            bail!("[test] needs type = \"test\"");
+        }
         if let Some(source) = &self.source {
             source.check()?;
+        }
+        for step in &self.generate {
+            step.check()?;
         }
         for (key, dep) in &self.dependencies {
             if dep.path.is_some() == dep.version.is_some() {
                 bail!("dependency '{key}' needs exactly one of path and version");
             }
-            if dep.link == Some(Kind::Executable) {
+            if matches!(dep.link, Some(Kind::Executable | Kind::Test)) {
                 bail!("dependency '{key}': link must be \"static\" or \"shared\"");
             }
         }
@@ -497,9 +599,6 @@ fn add_build(base: &mut Build, extra: &Build) {
     if extra.crt.is_some() {
         base.crt = extra.crt;
     }
-    if extra.entry.is_some() {
-        base.entry = extra.entry.clone();
-    }
     if extra.subsystem.is_some() {
         base.subsystem = extra.subsystem.clone();
     }
@@ -508,6 +607,21 @@ fn add_build(base: &mut Build, extra: &Build) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_packages_build_as_executables() {
+        let text = "[package]\nname = \"t\"\ntype = \"test\"\n\n[test]\ntimeout = 5\nargs = [\"-q\"]\n";
+        let manifest: Manifest = toml::from_str(text).unwrap();
+        manifest.check().unwrap();
+        assert!(manifest.package.is_test());
+        assert_eq!(manifest.package.kind(), Kind::Executable);
+        assert_eq!(manifest.test.timeout, Some(5));
+
+        let plain: Manifest = toml::from_str("[package]\nname = \"a\"\n\n[test]\ntimeout = 5\n").unwrap();
+        assert!(plain.check().is_err());
+        let mixed: Manifest = toml::from_str("[package]\nname = \"a\"\ntype = [\"static\", \"test\"]\n").unwrap();
+        assert!(mixed.check().is_err());
+    }
 
     const FEATURES: &str = r#"
 [package]

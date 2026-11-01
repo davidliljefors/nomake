@@ -1,6 +1,8 @@
 //! Every compiler, archiver and linker switch nomake emits, grouped by dialect. The command-line builders in
 //! `toolchain.rs` only walk these tables, so supporting another compiler means adding a table, not another branch.
 
+use crate::config::Crt;
+
 /// How a switch takes its value.
 #[derive(Clone, Copy)]
 pub enum Opt {
@@ -36,11 +38,19 @@ pub struct CompileDialect {
     pub std: Opt,
     pub release: &'static [&'static str],
     pub debug: &'static [&'static str],
-    /// Selects the (debug) C runtime to link; dropped when building without one.
-    pub crt_release: &'static [&'static str],
-    pub crt_debug: &'static [&'static str],
-    /// No runtime assumptions, no stack cookies or default-library directives.
-    pub freestanding: &'static [&'static str],
+    /// `/MD`, `/MDd`, `/MT`, `/MTd` and their clang spellings: which runtime the object asks the linker for.
+    /// Indexed by [`crt_index`].
+    pub crt: [&'static [&'static str]; 4],
+}
+
+/// Position in a dialect's `crt` table.
+pub fn crt_index(crt: Crt, release: bool) -> usize {
+    match (crt, release) {
+        (Crt::Dynamic, true) => 0,
+        (Crt::Dynamic, false) => 1,
+        (Crt::Static, true) => 2,
+        (Crt::Static, false) => 3,
+    }
 }
 
 pub const MSVC_COMPILE: CompileDialect = CompileDialect {
@@ -53,9 +63,7 @@ pub const MSVC_COMPILE: CompileDialect = CompileDialect {
     std: Opt::Joined("/std:c++"),
     release: &["/O2", "/DNDEBUG"],
     debug: &["/Od", "/Z7"],
-    crt_release: &["/MD"],
-    crt_debug: &["/MDd"],
-    freestanding: &["/GS-", "/Zl"],
+    crt: [&["/MD"], &["/MDd"], &["/MT"], &["/MTd"]],
 };
 
 pub const GNU_COMPILE: CompileDialect = CompileDialect {
@@ -68,11 +76,16 @@ pub const GNU_COMPILE: CompileDialect = CompileDialect {
     std: Opt::Joined("-std=c++"),
     release: &["-O2", "-DNDEBUG"],
     debug: &["-O0", "-g"],
-    crt_release: &[],
-    crt_debug: &[],
-    // Clang emits no unwind info for C otherwise, which leaves stack traces empty.
-    freestanding: &["-ffreestanding", "-fno-stack-protector", "-funwind-tables"],
+    crt: [&[], &[], &[], &[]],
 };
+
+/// Clang targeting Windows from the GNU-style driver; elsewhere the C library is the system's and there is nothing to pick.
+pub const CLANG_WINDOWS_CRT: [&[&str]; 4] = [
+    &["-fms-runtime-lib=dll"],
+    &["-fms-runtime-lib=dll_dbg"],
+    &["-fms-runtime-lib=static"],
+    &["-fms-runtime-lib=static_dbg"],
+];
 
 /// Header-dependency output for GNU-style compilers; MSVC reports through /showIncludes.
 pub const GNU_DEPFILE: Opt = Opt::Split("-MF");
@@ -107,9 +120,8 @@ pub struct LinkDialect {
     pub implib: Option<Opt>,
     /// Bare name of a system library to the argument that links it.
     pub sys_lib: fn(&str) -> String,
-    /// Drops every default library, the C runtime included.
-    pub no_default_libs: &'static [&'static str],
-    pub entry: Option<Opt>,
+    /// Asks for the C runtime to be linked statically, where the driver has a switch for it.
+    pub static_crt: &'static [&'static str],
     pub subsystem: Option<Opt>,
 }
 
@@ -119,8 +131,7 @@ pub const COFF_LINK: LinkDialect = LinkDialect {
     shared: &["/DLL"],
     implib: Some(Opt::Joined("/IMPLIB:")),
     sys_lib: |name| format!("{name}.lib"),
-    no_default_libs: &["/NODEFAULTLIB"],
-    entry: Some(Opt::Joined("/ENTRY:")),
+    static_crt: &[],
     subsystem: Some(Opt::Joined("/SUBSYSTEM:")),
 };
 
@@ -130,8 +141,7 @@ pub const DRIVER_LINK: LinkDialect = LinkDialect {
     shared: &["-shared"],
     implib: None,
     sys_lib: |name| format!("-l{name}"),
-    no_default_libs: &["-nostdlib"],
-    entry: Some(Opt::Joined("-Wl,-e,")),
+    static_crt: &["-static"],
     subsystem: None,
 };
 
@@ -140,10 +150,13 @@ pub const LLD_DEBUG_LINK: &str = "/DEBUG:GHASH";
 pub const DRIVER_DEBUG_LINK: &str = "-g";
 pub const LINUX_RPATH_ORIGIN: &str = "-Wl,-rpath,$ORIGIN";
 
-/// Prefix of the default-library switches a compiler driver bakes into the linker command it would run.
-pub fn is_default_lib(word: &str) -> bool {
+/// The runtime default-library switches a compiler driver bakes into the linker command it would run. The
+/// objects name the runtime they were compiled for, so the driver's own pick would only conflict.
+pub fn is_runtime_lib(word: &str) -> bool {
     let lower = word.to_ascii_lowercase();
-    ["-defaultlib:", "/defaultlib:"]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
+    ["-defaultlib:", "/defaultlib:"].iter().any(|prefix| {
+        lower.strip_prefix(prefix).is_some_and(|name| {
+            matches!(name.trim_end_matches(".lib"), "libcmt" | "libcmtd" | "msvcrt" | "msvcrtd")
+        })
+    })
 }
