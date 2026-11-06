@@ -47,7 +47,9 @@ fn run_one(exe: &PathBuf, test: &Test, extra: &[String]) -> Result<(Outcome, Str
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
     let sink: Sink = Arc::default();
     let readers = [
         drain(child.stdout.take().unwrap(), sink.clone()),

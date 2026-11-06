@@ -117,9 +117,10 @@ pub fn generate_for(root_dir: &Path, member_dirs: &[PathBuf], archs: &[Arch]) ->
     // Visual Studio starts the first project of the solution, so programs go first.
     projects.sort_by_key(|p| (!p.builds, !p.executable));
     let solution_name = if workspace {
-        root_dir
-            .file_name()
-            .map_or_else(|| "nomake".to_string(), |n| n.to_string_lossy().into_owned())
+        root_dir.file_name().map_or_else(
+            || "nomake".to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )
     } else {
         ws.root().name.clone()
     };

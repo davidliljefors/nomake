@@ -118,7 +118,10 @@ fn select<'a>(root: &'a Root, names: &[String]) -> Result<Vec<&'a Member>> {
             Some(member) => chosen.push(member),
             None => {
                 let known: Vec<&str> = root.members.iter().map(|m| m.name.as_str()).collect();
-                bail!("no workspace member '{name}' (members: {})", known.join(", "));
+                bail!(
+                    "no workspace member '{name}' (members: {})",
+                    known.join(", ")
+                );
             }
         }
     }
@@ -162,15 +165,12 @@ pub fn test(root: &Root, names: &[String], opts: BuildOpts, extra: &[String]) ->
 pub fn run(root: &Root, names: &[String], mut opts: BuildOpts, args: &[String]) -> Result<i32> {
     let programs: Vec<&Member> = select(root, names)?
         .into_iter()
-        .filter(|member| member.kind == Kind::Executable && (member.test.is_none() || !names.is_empty()))
+        .filter(|member| {
+            member.kind == Kind::Executable && (member.test.is_none() || !names.is_empty())
+        })
         .collect();
-    let member = match programs.as_slice() {
-        [one] => *one,
-        [] => bail!("no executable to run in this workspace"),
-        many => {
-            let list: Vec<&str> = many.iter().map(|m| m.name.as_str()).collect();
-            bail!("several executables, name one: {}", list.join(", "));
-        }
+    let Some(member) = programs.first() else {
+        bail!("no executable to run in this workspace");
     };
     opts.refresh_compdb = false;
     opts.roots = vec![member.dir.clone()];
@@ -183,5 +183,9 @@ pub fn compdb(root: &Root, arch: Arch, release: bool) -> Result<()> {
 }
 
 pub fn solution(root: &Root, archs: &[Arch]) -> Result<()> {
-    vs::generate_for(&root.dir, &dirs(&root.members.iter().collect::<Vec<_>>()), archs)
+    vs::generate_for(
+        &root.dir,
+        &dirs(&root.members.iter().collect::<Vec<_>>()),
+        archs,
+    )
 }

@@ -569,7 +569,14 @@ impl Toolchain {
             &dialect.crt
         };
         flags::extend(&mut args, table[crt_index(spec.crt, spec.release)]);
-        flags::extend(&mut args, self.object_flags(spec.release));
+        let lld_codeview = match self.family {
+            Family::ClangCl => true,
+            Family::Clang => cfg!(windows),
+            Family::Msvc | Family::Gcc => false,
+        };
+        if lld_codeview && !spec.release {
+            flags::extend(&mut args, CODEVIEW_GHASH);
+        }
         if !msvc && !spec.release && cfg!(target_os = "linux") {
             flags::extend(&mut args, SPLIT_DWARF);
         }
@@ -584,21 +591,6 @@ impl Toolchain {
         }
         args.extend(spec.flags.iter().cloned());
         args
-    }
-
-    /// Switches that make unchanged objects byte-identical, so the link can be skipped.
-    fn object_flags(&self, release: bool) -> &'static [&'static str] {
-        let llvm = if release {
-            LLVM_REPRODUCIBLE
-        } else {
-            LLVM_REPRODUCIBLE_DEBUG
-        };
-        match self.family {
-            Family::Msvc => CL_REPRODUCIBLE,
-            Family::ClangCl => llvm,
-            Family::Clang if cfg!(windows) => llvm,
-            Family::Clang | Family::Gcc => &[],
-        }
     }
 
     pub fn archive_args(&self, out: &Path, objs: &[PathBuf]) -> Vec<String> {

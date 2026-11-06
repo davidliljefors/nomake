@@ -212,7 +212,7 @@ members = ["my-lib", "my-lib/tests", "tools/*"]
 ```
 nomake build                # every member
 nomake build app tests      # some members
-nomake run app
+nomake run app              # without a name: the first executable in `members`
 ```
 
 ## Examples

@@ -3,7 +3,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
-use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
 use rayon::prelude::*;
@@ -126,7 +125,6 @@ struct Ctx<'a> {
     failed: AtomicBool,
     started: AtomicUsize,
     total: AtomicUsize,
-    print: Mutex<()>,
     verbose: bool,
 }
 
@@ -184,7 +182,6 @@ pub fn run(
         failed: AtomicBool::new(false),
         started: AtomicUsize::new(0),
         total: AtomicUsize::new(0),
-        print: Mutex::new(()),
         verbose,
     };
 
@@ -299,7 +296,6 @@ impl<'a> Ctx<'a> {
     }
 
     fn report(&self, msg: String) {
-        let _guard = self.print.lock().unwrap();
         eprint!("{msg}");
     }
 
@@ -318,13 +314,12 @@ impl<'a> Ctx<'a> {
             self.total.fetch_add(1, SeqCst);
         }
         let number = self.started.fetch_add(1, SeqCst) + 1;
-        {
-            let _guard = self.print.lock().unwrap();
-            println!("[{}/{}] {}", number, self.total.load(SeqCst), node.desc);
-            if self.verbose {
-                println!("{}", node.command_line());
-            }
+        let mut header = format!("[{}/{}] {}\n", number, self.total.load(SeqCst), node.desc);
+        if self.verbose {
+            header.push_str(&node.command_line());
+            header.push('\n');
         }
+        print!("{header}");
 
         for output in &node.outputs {
             if let Some(dir) = output.parent() {

@@ -3,8 +3,11 @@
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs;
+use std::io::{BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::Mutex;
 
 use super::run;
 use crate::config::Source;
@@ -33,18 +36,20 @@ impl Job {
         }
     }
 
-    fn run(&self) -> Result<()> {
+    fn run(&self, board: &Board, row: usize) -> Result<()> {
         if self.dest.is_dir() {
             return Ok(());
         }
         let (name, version) = (&self.name, &self.version);
         let src = self.dest.parent().unwrap();
         fs::create_dir_all(src)?;
-        println!("nomake: fetching {name} {version}");
+        if !board.live {
+            println!("nomake: fetching {name} {version}");
+        }
         let temp = src.join(format!(".tmp-{name}-{version}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp);
         fs::create_dir_all(&temp)?;
-        if let Err(err) = fetch_git(&self.source, &temp) {
+        if let Err(err) = fetch_git(&self.source, &temp, &mut |percent| board.set(row, percent)) {
             let _ = fs::remove_dir_all(&temp);
             return Err(format!("fetching {name} {version}: {err}").into());
         }
@@ -58,7 +63,57 @@ impl Job {
                 );
             }
         }
+        board.set(row, 100);
         Ok(())
+    }
+}
+
+/// The percentage of every running fetch, redrawn as a single line when stdout is a terminal.
+struct Board {
+    rows: Mutex<Vec<(String, u32)>>,
+    drawn: AtomicUsize,
+    live: bool,
+}
+
+impl Board {
+    fn new(jobs: &[&Job]) -> Board {
+        Board {
+            rows: Mutex::new(
+                jobs.iter()
+                    .map(|job| (format!("{} {}", job.name, job.version), 0))
+                    .collect(),
+            ),
+            drawn: AtomicUsize::new(0),
+            live: std::io::stdout().is_terminal(),
+        }
+    }
+
+    fn set(&self, row: usize, percent: u32) {
+        let mut rows = self.rows.lock().unwrap();
+        if rows[row].1 == percent {
+            return;
+        }
+        rows[row].1 = percent;
+        if self.live {
+            let parts: Vec<String> = rows
+                .iter()
+                .filter(|(_, percent)| *percent < 100)
+                .map(|(name, percent)| format!("{name} {percent}%"))
+                .collect();
+            let line = format!("nomake: fetching {}", parts.join(", "));
+            let stale = self
+                .drawn
+                .swap(line.len(), SeqCst)
+                .saturating_sub(line.len());
+            print!("\r{line}{:stale$}", "");
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    fn finish(&self) {
+        if self.live && self.drawn.load(SeqCst) > 0 {
+            println!();
+        }
     }
 }
 
@@ -69,17 +124,65 @@ pub fn fetch_all(jobs: &[Job]) -> Result<()> {
         .iter()
         .filter(|job| !job.dest.is_dir() && seen.insert(&job.dest))
         .collect();
-    missing
+    let board = Board::new(&missing);
+    let result = missing
         .par_iter()
-        .map(|job| job.run())
+        .enumerate()
+        .map(|(row, job)| job.run(&board, row))
         .collect::<Result<Vec<_>>>()
-        .map(|_| ())
+        .map(|_| ());
+    board.finish();
+    result
 }
 
-fn fetch_git(source: &Source, dir: &Path) -> Result<()> {
+fn receiving_percent(line: &str) -> Option<u32> {
+    let rest = line.strip_prefix("Receiving objects:")?;
+    rest.trim_start().split('%').next()?.parse().ok()
+}
+
+/// `git fetch` with its progress read from stderr, where git ends each update with `\r`.
+fn git_fetch(source: &Source, dir: &Path, on_percent: &mut dyn FnMut(u32)) -> Result<()> {
+    let mut child = Command::new("git")
+        .args([
+            "fetch",
+            "--progress",
+            "--depth",
+            "1",
+            &source.git,
+            &source.rev,
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    let (mut line, mut errors) = (Vec::new(), String::new());
+    for byte in BufReader::new(child.stderr.take().unwrap()).bytes() {
+        let byte = byte?;
+        if byte != b'\r' && byte != b'\n' {
+            line.push(byte);
+            continue;
+        }
+        let text = String::from_utf8_lossy(&line);
+        if let Some(percent) = receiving_percent(&text) {
+            on_percent(percent);
+        } else if !text.is_empty() && !text.contains('%') {
+            errors.push_str(&text);
+            errors.push('\n');
+        }
+        line.clear();
+    }
+    if child.wait()?.success() {
+        return Ok(());
+    }
+    Err(format!("git fetch failed: {}", errors.trim()).into())
+}
+
+fn fetch_git(source: &Source, dir: &Path, on_percent: &mut dyn FnMut(u32)) -> Result<()> {
     let git = |args: &[&str]| run(Command::new("git").args(args).current_dir(dir));
     git(&["init", "-q"])?;
-    git(&["fetch", "-q", "--depth", "1", &source.git, &source.rev])?;
+    git_fetch(source, dir, on_percent)?;
     git(&[
         "-c",
         "advice.detachedHead=false",
@@ -95,6 +198,20 @@ fn fetch_git(source: &Source, dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::env;
+
+    #[test]
+    fn percent_is_read_from_the_receiving_line_only() {
+        assert_eq!(
+            receiving_percent("Receiving objects:  43% (86/200), 1.2 MiB"),
+            Some(43)
+        );
+        assert_eq!(
+            receiving_percent("Receiving objects: 100% (200/200), done."),
+            Some(100)
+        );
+        assert_eq!(receiving_percent("Resolving deltas:  43% (3/7)"), None);
+        assert_eq!(receiving_percent("fatal: repository not found"), None);
+    }
 
     #[test]
     fn missing_sources_are_fetched_once_into_the_cache() {

@@ -91,11 +91,7 @@ pub const CLANG_WINDOWS_CRT: [&[&str]; 4] = [
 pub const GNU_DEPFILE: Opt = Opt::Split("-MF");
 pub const GNU_DEPFILE_FLAGS: &[&str] = &["-MMD", "-MP"];
 
-/// Objects without a timestamp are byte-identical when nothing changed, which lets the link be skipped.
-pub const CL_REPRODUCIBLE: &[&str] = &["/Brepro"];
-pub const LLVM_REPRODUCIBLE: &[&str] = &["-mno-incremental-linker-compatible"];
-pub const LLVM_REPRODUCIBLE_DEBUG: &[&str] =
-    &["-mno-incremental-linker-compatible", "-gcodeview-ghash"];
+pub const CODEVIEW_GHASH: &[&str] = &["-gcodeview-ghash"];
 /// Split DWARF keeps debug info out of the link inputs.
 pub const SPLIT_DWARF: &[&str] = &["-gsplit-dwarf"];
 pub const PIC: &[&str] = &["-fPIC"];
@@ -156,7 +152,10 @@ pub fn is_runtime_lib(word: &str) -> bool {
     let lower = word.to_ascii_lowercase();
     ["-defaultlib:", "/defaultlib:"].iter().any(|prefix| {
         lower.strip_prefix(prefix).is_some_and(|name| {
-            matches!(name.trim_end_matches(".lib"), "libcmt" | "libcmtd" | "msvcrt" | "msvcrtd")
+            matches!(
+                name.trim_end_matches(".lib"),
+                "libcmt" | "libcmtd" | "msvcrt" | "msvcrtd"
+            )
         })
     })
 }

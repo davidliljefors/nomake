@@ -460,13 +460,21 @@ mod tests {
     fn feature_peers_come_from_the_root_dependencies() {
         let root = std::env::temp_dir().join(format!("nomake_peers_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        write(&root, "sdl/nomake.toml", "[package]\nname = \"sdl\"\ntype = \"static\"\n[include]\npublic = [\"include\"]\n");
+        write(
+            &root,
+            "sdl/nomake.toml",
+            "[package]\nname = \"sdl\"\ntype = \"static\"\n[include]\npublic = [\"include\"]\n",
+        );
         write(&root, "sdl/a.c", "");
         write(&root, "ui/nomake.toml", "[package]\nname = \"ui\"\ntype = \"static\"\n[features]\ndefault = []\n[feature.sdl]\npeer = [\"sdl\"]\nsources.files = [\"b.c\"]\n");
         write(&root, "ui/b.c", "");
         write(&root, "app/main.c", "");
         let app = |dependencies: &str| {
-            write(&root, "app/nomake.toml", &format!("[package]\nname = \"app\"\n[dependencies]\n{dependencies}"));
+            write(
+                &root,
+                "app/nomake.toml",
+                &format!("[package]\nname = \"app\"\n[dependencies]\n{dependencies}"),
+            );
             load(&root.join("app"))
         };
         let on = "ui = { path = \"../ui\", features = [\"sdl\"] }\n";

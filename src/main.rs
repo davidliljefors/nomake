@@ -11,8 +11,8 @@ mod init;
 mod registry;
 mod scanner;
 mod state;
-mod toolchain;
 mod testrun;
+mod toolchain;
 mod util;
 mod workspace;
 
@@ -46,7 +46,7 @@ COMMANDS:
 WORKSPACES:
     A nomake.toml with a [workspace] table (members = [\"libs/*\", \"app\"]) makes build, run, clean,
     compdb and vs act on every member. Name members to pick some: `nomake build app tests`,
-    `nomake run app`. `build` skips members of type \"test\" unless named; `nomake test` runs them
+    `nomake run app`; without a name `run` starts the first executable in `members`. `build` skips members of type \"test\" unless named; `nomake test` runs them
     (`nomake test core`, each with a timeout from its [test] table, default 60s). compile_commands.json
     and the solution are written at the root.
 
@@ -140,7 +140,9 @@ fn real_main() -> Result<i32> {
     let args = parse(argv.collect())?;
     let here = util::absolute(std::path::Path::new("."));
     let workspace = match command.as_str() {
-        "build" | "b" | "run" | "r" | "test" | "t" | "clean" | "compdb" | "vs" => workspace::find(&here)?,
+        "build" | "b" | "run" | "r" | "test" | "t" | "clean" | "compdb" | "vs" => {
+            workspace::find(&here)?
+        }
         _ => None,
     };
     if command == "vs" {

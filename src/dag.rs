@@ -164,7 +164,7 @@ fn closure(ws: &Workspace, pkg_idx: usize) -> Vec<usize> {
             }
         }
     }
-    seen.into_iter().collect()
+    by_name(ws, seen)
 }
 
 /// Packages whose headers and defines `pkg_idx` sees: its direct dependencies and peers plus whatever those re-export.
@@ -177,7 +177,13 @@ fn visible(ws: &Workspace, pkg_idx: usize) -> Vec<usize> {
             stack.extend(&ws.pkgs[current].reexports);
         }
     }
-    seen.into_iter().collect()
+    by_name(ws, seen)
+}
+
+fn by_name(ws: &Workspace, set: BTreeSet<usize>) -> Vec<usize> {
+    let mut list: Vec<usize> = set.into_iter().collect();
+    list.sort_by(|&a, &b| ws.pkgs[a].name.cmp(&ws.pkgs[b].name));
+    list
 }
 
 fn hashed(mut node: Node) -> Node {
@@ -248,7 +254,9 @@ fn generate_nodes(
                 let found = pkg
                     .deps
                     .iter()
-                    .find(|&&dep| ws.pkgs[dep].name == *name && ws.pkgs[dep].kind == Kind::Executable)
+                    .find(|&&dep| {
+                        ws.pkgs[dep].name == *name && ws.pkgs[dep].kind == Kind::Executable
+                    })
                     .and_then(|&dep| built[dep].artifact.clone());
                 match found {
                     Some(artifact) => Some(artifact),
@@ -454,9 +462,9 @@ pub fn build(
                     .iter()
                     .flat_map(|&dep| built[dep].gens.clone()),
             )
-            .collect(            );
+            .collect();
 
-            let mut sources: Vec<(PathBuf, Option<usize>)> = pkg
+        let mut sources: Vec<(PathBuf, Option<usize>)> = pkg
             .sources
             .iter()
             .map(|path| (path.clone(), None))
@@ -717,7 +725,10 @@ pub fn build(
         .iter()
         .map(|&idx| {
             let pkg = &ws.pkgs[idx];
-            (pkg.root.clone(), out_dir.join(tc.artifact(pkg.kind, &pkg.name).0))
+            (
+                pkg.root.clone(),
+                out_dir.join(tc.artifact(pkg.kind, &pkg.name).0),
+            )
         })
         .collect();
 
@@ -786,6 +797,34 @@ mod tests {
     }
 
     #[test]
+    fn scope_does_not_depend_on_which_roots_were_loaded() {
+        let root = std::env::temp_dir().join(format!("nomake_order_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        lib(&root, "alpha", "");
+        lib(&root, "zed", "");
+        lib(
+            &root,
+            "app",
+            "alpha = { path = \"../alpha\" }\nzed = { path = \"../zed\" }",
+        );
+        let scope = |ws: &Workspace| {
+            let app = ws.pkgs.iter().position(|pkg| pkg.name == "app").unwrap();
+            let (includes, _) = compile_scope(ws, app, &root.join("gen"));
+            let linked: Vec<&str> = closure(ws, app)
+                .into_iter()
+                .map(|dep| ws.pkgs[dep].name.as_str())
+                .collect();
+            (includes, linked.join(" "))
+        };
+        let alone = crate::scanner::load(&root.join("app")).unwrap();
+        // Loading zed first gives it the lower package index.
+        let with_zed_first =
+            crate::scanner::load_roots(&root, &[root.join("zed"), root.join("app")]).unwrap();
+        assert_eq!(scope(&alone), scope(&with_zed_first));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn tool_steps_run_the_built_tool_per_input_and_are_not_linked() {
         let root = std::env::temp_dir().join(format!("nomake_tool_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -842,7 +881,8 @@ mod tests {
         assert!(link
             .inputs
             .iter()
-            .all(|input| !input.to_string_lossy().contains("tool.exe") && input.file_stem().unwrap() != "tool"));
+            .all(|input| !input.to_string_lossy().contains("tool.exe")
+                && input.file_stem().unwrap() != "tool"));
         fs::remove_dir_all(root).unwrap();
     }
 

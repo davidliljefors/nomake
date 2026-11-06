@@ -375,7 +375,10 @@ impl Generate {
             bail!("[[generate]] '{}' needs `outputs`", self.label());
         }
         if self.tool.is_some() && self.batch {
-            bail!("[[generate]] '{}': a tool step runs once per input", self.label());
+            bail!(
+                "[[generate]] '{}': a tool step runs once per input",
+                self.label()
+            );
         }
         Ok(())
     }
@@ -610,16 +613,19 @@ mod tests {
 
     #[test]
     fn test_packages_build_as_executables() {
-        let text = "[package]\nname = \"t\"\ntype = \"test\"\n\n[test]\ntimeout = 5\nargs = [\"-q\"]\n";
+        let text =
+            "[package]\nname = \"t\"\ntype = \"test\"\n\n[test]\ntimeout = 5\nargs = [\"-q\"]\n";
         let manifest: Manifest = toml::from_str(text).unwrap();
         manifest.check().unwrap();
         assert!(manifest.package.is_test());
         assert_eq!(manifest.package.kind(), Kind::Executable);
         assert_eq!(manifest.test.timeout, Some(5));
 
-        let plain: Manifest = toml::from_str("[package]\nname = \"a\"\n\n[test]\ntimeout = 5\n").unwrap();
+        let plain: Manifest =
+            toml::from_str("[package]\nname = \"a\"\n\n[test]\ntimeout = 5\n").unwrap();
         assert!(plain.check().is_err());
-        let mixed: Manifest = toml::from_str("[package]\nname = \"a\"\ntype = [\"static\", \"test\"]\n").unwrap();
+        let mixed: Manifest =
+            toml::from_str("[package]\nname = \"a\"\ntype = [\"static\", \"test\"]\n").unwrap();
         assert!(mixed.check().is_err());
     }
 

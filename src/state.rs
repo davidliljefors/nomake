@@ -3,8 +3,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, RwLock};
+use std::thread::JoinHandle;
 
 use rayon::prelude::*;
 
@@ -38,8 +38,35 @@ struct Tables {
 
 pub struct State {
     tables: RwLock<Tables>,
-    log: Mutex<BufWriter<File>>,
-    warned: AtomicBool,
+    log: Option<mpsc::Sender<Message>>,
+    writer: Option<JoinHandle<()>>,
+}
+
+enum Message {
+    Append(Vec<u8>),
+    Flush(mpsc::Sender<()>),
+}
+
+fn write_log(file: File, messages: mpsc::Receiver<Message>) {
+    let mut out = BufWriter::new(file);
+    let mut warned = false;
+    let mut check = |result: std::io::Result<()>| {
+        if let Err(err) = result {
+            if !std::mem::replace(&mut warned, true) {
+                eprintln!("nomake: warning: cannot write the build state, the next build will redo work: {err}");
+            }
+        }
+    };
+    for message in messages {
+        match message {
+            Message::Append(buf) => check(out.write_all(&buf)),
+            Message::Flush(done) => {
+                check(out.flush());
+                let _ = done.send(());
+            }
+        }
+    }
+    check(out.flush());
 }
 
 fn put_path(buf: &mut Vec<u8>, path: &str) {
@@ -193,24 +220,20 @@ impl State {
             tables = compacted;
         }
         let file = OpenOptions::new().append(true).open(path)?;
+        let (log, messages) = mpsc::channel();
+        let writer = std::thread::Builder::new()
+            .name("state-log".into())
+            .spawn(move || write_log(file, messages))?;
         Ok(State {
             tables: RwLock::new(tables),
-            log: Mutex::new(BufWriter::new(file)),
-            warned: AtomicBool::new(false),
+            log: Some(log),
+            writer: Some(writer),
         })
     }
 
-    /// The log only speeds up the next build, so a failed write warns once instead of failing this one.
-    fn append(&self, buf: &[u8]) {
-        let result = self.log.lock().unwrap().write_all(buf);
-        self.check(result);
-    }
-
-    fn check(&self, result: std::io::Result<()>) {
-        if let Err(err) = result {
-            if !self.warned.swap(true, Relaxed) {
-                eprintln!("nomake: warning: cannot write the build state, the next build will redo work: {err}");
-            }
+    fn append(&self, buf: Vec<u8>) {
+        if let Some(log) = &self.log {
+            let _ = log.send(Message::Append(buf));
         }
     }
 
@@ -228,7 +251,7 @@ impl State {
         tables.ids.insert(key.to_string(), id);
         let mut buf = Vec::new();
         put_path(&mut buf, &key);
-        self.append(&buf);
+        self.append(buf);
         id
     }
 
@@ -275,7 +298,7 @@ impl State {
         put_entry(&mut buf, out, &entry);
         let mut tables = self.tables.write().unwrap();
         tables.entries.insert(out, Arc::new(entry));
-        self.append(&buf);
+        self.append(buf);
     }
 
     pub fn contents(&self) -> Vec<(u32, Content)> {
@@ -296,11 +319,26 @@ impl State {
         let mut buf = Vec::new();
         put_content(&mut buf, path, &content);
         self.tables.write().unwrap().contents.insert(path, content);
-        self.append(&buf);
+        self.append(buf);
     }
 
+    /// Returns once everything recorded so far is written to the file.
     pub fn flush(&self) {
-        let result = self.log.lock().unwrap().flush();
-        self.check(result);
+        let Some(log) = &self.log else {
+            return;
+        };
+        let (done, wait) = mpsc::channel();
+        if log.send(Message::Flush(done)).is_ok() {
+            let _ = wait.recv();
+        }
+    }
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        self.log = None;
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
     }
 }
