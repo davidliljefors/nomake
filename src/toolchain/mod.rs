@@ -334,7 +334,7 @@ fn driver_linker(
     command
         .current_dir(cache)
         .args(target_args)
-        .args(["-###", "probe.o"]);
+        .args(["-fuse-ld=lld", "-###", "probe.o"]);
     command.arg(if family == Family::ClangCl {
         "/Feprobe.exe"
     } else {
