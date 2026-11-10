@@ -363,6 +363,27 @@ pub fn is_header(path: &Path) -> bool {
     })
 }
 
+/// Headers in `dir`, and in its subfolders when `recursive`.
+pub fn collect_headers(dir: &Path, recursive: bool, out: &mut BTreeSet<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') || name == "build" {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            if recursive {
+                collect_headers(&path, true, out);
+            }
+        } else if is_header(&path) {
+            out.insert(path);
+        }
+    }
+}
+
 pub fn collect_sources(root: &Path, cfg: &crate::config::Sources) -> Vec<PathBuf> {
     let dirs = match &cfg.dirs {
         Some(dirs) => dirs.clone(),

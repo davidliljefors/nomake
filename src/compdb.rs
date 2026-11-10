@@ -24,28 +24,38 @@ fn fingerprint(graph: &Graph) -> u64 {
         bytes.extend(node.hash.to_le_bytes());
         bytes.extend(node.outputs[0].as_os_str().as_encoded_bytes());
     }
+    for header in &graph.headers {
+        bytes.extend(header.hash().to_le_bytes());
+        bytes.extend(header.path.as_os_str().as_encoded_bytes());
+    }
     util::hash(&bytes)
 }
 
-/// One JSON object per compiled source.
+fn entry(graph: &Graph, file: &Path, program: &Path, args: &[String]) -> String {
+    let args: Vec<String> = std::iter::once(program.to_string_lossy().into_owned())
+        .chain(args.iter().cloned())
+        .map(|arg| json(&arg))
+        .collect();
+    format!(
+        "  {{\"directory\": {}, \"file\": {}, \"arguments\": [{}]}}",
+        json(&graph.root_dir.to_string_lossy()),
+        json(&file.to_string_lossy()),
+        args.join(", ")
+    )
+}
+
+/// One JSON object per compiled source and per header, so clangd never has to guess a header's flags.
 pub fn entries(graph: &Graph) -> Vec<String> {
-    graph
+    let sources = graph
         .nodes
         .iter()
         .filter(|node| node.kind == NodeKind::Compile)
-        .map(|node| {
-            let args: Vec<String> = std::iter::once(node.program.to_string_lossy().into_owned())
-                .chain(node.args().iter().cloned())
-                .map(|arg| json(&arg))
-                .collect();
-            format!(
-                "  {{\"directory\": {}, \"file\": {}, \"arguments\": [{}]}}",
-                json(&graph.root_dir.to_string_lossy()),
-                json(&node.inputs[0].to_string_lossy()),
-                args.join(", ")
-            )
-        })
-        .collect()
+        .map(|node| entry(graph, &node.inputs[0], &node.program, &node.args()));
+    let headers = graph
+        .headers
+        .iter()
+        .map(|header| entry(graph, &header.path, header.program(), &header.args()));
+    sources.chain(headers).collect()
 }
 
 /// Writes `compile_commands.json` into `dir`, leaving the file alone when nothing changed.

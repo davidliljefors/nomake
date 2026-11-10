@@ -131,9 +131,43 @@ impl Node {
     }
 }
 
+/// A header with the flags of the package that owns it; only the compile database uses it.
+pub struct Header {
+    pub path: PathBuf,
+    cfg: Arc<CompileCfg>,
+    obj: PathBuf,
+}
+
+impl Header {
+    pub fn program(&self) -> &Path {
+        &self.cfg.tc.cxx
+    }
+
+    pub fn hash(&self) -> u64 {
+        self.cfg.hash
+    }
+
+    pub fn args(&self) -> Vec<String> {
+        let depfile = self.obj.with_extension("d");
+        let mut args = self
+            .cfg
+            .tc
+            .compile_args(&self.cfg.spec(&self.path, &self.obj, &depfile, false));
+        // The extension alone would make `.h` a C header.
+        let lang: &[&str] = if self.cfg.tc.msvc_style() {
+            &["/TP"]
+        } else {
+            &["-x", "c++-header"]
+        };
+        args.splice(0..0, lang.iter().map(|arg| arg.to_string()));
+        args
+    }
+}
+
 /// Nodes are ordered so every edge points to a lower index.
 pub struct Graph {
     pub nodes: Vec<Node>,
+    pub headers: Vec<Header>,
     pub dependents: Vec<Vec<usize>>,
     pub env: Vec<(String, String)>,
     pub sys_includes: Vec<String>,
@@ -439,6 +473,8 @@ pub fn build(
     out_dir: &Path,
 ) -> Result<Graph> {
     let mut nodes: Vec<Node> = Vec::new();
+    let mut headers: Vec<Header> = Vec::new();
+    let mut seen_headers: BTreeSet<PathBuf> = BTreeSet::new();
     let mut built: Vec<Built> = Vec::new();
     let tc_arc = Arc::new(tc.clone());
     let obj_ext = if tc.msvc_style() { "obj" } else { "o" };
@@ -518,6 +554,34 @@ pub fn build(
         let probe = tc.compile_args(&cfg.spec(Path::new(""), Path::new(""), Path::new(""), false));
         cfg.hash = util::hash(format!("{}\0{}", tc.cxx.display(), probe.join("\0")).as_bytes());
         let cfg = Arc::new(cfg);
+
+        let mut found = BTreeSet::new();
+        for dir in pkg.include_public.iter().chain(&pkg.include_private) {
+            crate::scanner::collect_headers(dir, true, &mut found);
+        }
+        for dir in sources.iter().filter_map(|(src, _)| src.parent()) {
+            crate::scanner::collect_headers(dir, false, &mut found);
+        }
+        found.extend(
+            produced
+                .iter()
+                .filter(|output| crate::scanner::is_header(&output.path))
+                .map(|output| output.path.clone()),
+        );
+        for path in found {
+            if seen_headers.insert(path.clone()) {
+                let name = path.file_name().unwrap().to_string_lossy();
+                let obj = out_dir
+                    .join("obj")
+                    .join(&pkg.name)
+                    .join(format!("{name}.{obj_ext}"));
+                headers.push(Header {
+                    path,
+                    cfg: cfg.clone(),
+                    obj,
+                });
+            }
+        }
 
         let mut pch_node = None;
         let mut pch_obj = None;
@@ -741,6 +805,7 @@ pub fn build(
     }
     Ok(Graph {
         nodes,
+        headers,
         dependents,
         env: tc.env.clone(),
         sys_includes: tc.system_includes(),
