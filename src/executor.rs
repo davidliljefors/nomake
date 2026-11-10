@@ -264,13 +264,14 @@ impl<'a> Ctx<'a> {
         if entry.mtime != oldest_output {
             return Some("an output was modified outside the build".into());
         }
+        // Inputs are measured against what the last run saw, not against outputs a tool may have left alone.
         self.ins[idx].iter().chain(&entry.deps).find_map(|&dep| {
             let stamp = self.stats.stamp(dep);
             let path = || &self.stats.paths[dep as usize];
             if stamp == 0 {
                 Some(format!("input {} is missing", path()))
-            } else if stamp > oldest_output {
-                Some(format!("input {} is newer than the output", path()))
+            } else if stamp > entry.inputs {
+                Some(format!("input {} is newer than the last run", path()))
             } else {
                 None
             }
@@ -336,6 +337,18 @@ impl<'a> Ctx<'a> {
         if node.rm_outputs {
             let _ = fs::remove_file(&node.outputs[0]);
         }
+
+        let old_deps = self
+            .state
+            .entry(self.outs[idx][0])
+            .map_or_else(Vec::new, |entry| entry.deps.clone());
+        // Taken before the command runs, so an input edited meanwhile still reads as newer next time.
+        let inputs_seen = self.ins[idx]
+            .iter()
+            .chain(&old_deps)
+            .map(|&id| self.stats.stamp(id))
+            .max()
+            .unwrap_or(0);
 
         let rsp = match response_file(node) {
             Ok(rsp) => rsp,
@@ -423,9 +436,16 @@ impl<'a> Ctx<'a> {
             self.stats.mtimes[out as usize].store(mtime, SeqCst);
             oldest_output = oldest_output.min(mtime);
         }
-        let dep_ids = deps.iter().map(|path| self.state.intern(path)).collect();
+        let dep_ids: Vec<u32> = deps.iter().map(|path| self.state.intern(path)).collect();
+        // Dependencies met for the first time were not measured up front.
+        let mut inputs = inputs_seen;
+        for (path, id) in deps.iter().zip(&dep_ids) {
+            if !old_deps.contains(id) && !self.ins[idx].contains(id) {
+                inputs = inputs.max(stat(path));
+            }
+        }
         self.state
-            .record(self.outs[idx][0], oldest_output, node.hash, dep_ids);
+            .record(self.outs[idx][0], oldest_output, inputs, node.hash, dep_ids);
         if !node.cutoff {
             return Some(true);
         }

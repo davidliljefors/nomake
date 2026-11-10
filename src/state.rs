@@ -11,10 +11,12 @@ use rayon::prelude::*;
 use crate::util::Map;
 use crate::Result;
 
-const MAGIC: &[u8; 8] = b"NOMKST01";
+const MAGIC: &[u8; 8] = b"NOMKST02";
 
 pub struct Entry {
     pub mtime: u64,
+    /// The newest input stamp the step saw when it started.
+    pub inputs: u64,
     pub hash: u64,
     pub deps: Vec<u32>,
 }
@@ -79,6 +81,7 @@ fn put_entry(buf: &mut Vec<u8>, out: u32, entry: &Entry) {
     buf.push(2);
     buf.extend(out.to_le_bytes());
     buf.extend(entry.mtime.to_le_bytes());
+    buf.extend(entry.inputs.to_le_bytes());
     buf.extend(entry.hash.to_le_bytes());
     buf.extend((entry.deps.len() as u32).to_le_bytes());
     for dep in &entry.deps {
@@ -136,14 +139,21 @@ fn parse(data: &[u8]) -> (Tables, usize, bool) {
                 2 => {
                     let out = reader.u32()?;
                     let mtime = reader.u64()?;
+                    let inputs = reader.u64()?;
                     let hash = reader.u64()?;
                     let count = reader.u32()? as usize;
                     let deps = (0..count)
                         .map(|_| reader.u32())
                         .collect::<Option<Vec<_>>>()?;
-                    tables
-                        .entries
-                        .insert(out, Arc::new(Entry { mtime, hash, deps }));
+                    tables.entries.insert(
+                        out,
+                        Arc::new(Entry {
+                            mtime,
+                            inputs,
+                            hash,
+                            deps,
+                        }),
+                    );
                 }
                 3 => {
                     let path = reader.u32()?;
@@ -190,6 +200,7 @@ fn compact(old: &Tables) -> (Tables, Vec<u8>) {
             .collect();
         let entry = Entry {
             mtime: entry.mtime,
+            inputs: entry.inputs,
             hash: entry.hash,
             deps,
         };
@@ -292,8 +303,13 @@ impl State {
         self.tables.read().unwrap().entries.get(&out).cloned()
     }
 
-    pub fn record(&self, out: u32, mtime: u64, hash: u64, deps: Vec<u32>) {
-        let entry = Entry { mtime, hash, deps };
+    pub fn record(&self, out: u32, mtime: u64, inputs: u64, hash: u64, deps: Vec<u32>) {
+        let entry = Entry {
+            mtime,
+            inputs,
+            hash,
+            deps,
+        };
         let mut buf = Vec::new();
         put_entry(&mut buf, out, &entry);
         let mut tables = self.tables.write().unwrap();
