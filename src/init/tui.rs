@@ -14,14 +14,14 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 use ratatui::{DefaultTerminal, Frame};
 
 use super::registry::RegistryView;
-use super::{kind_name, Computed, Model, NodeKind, State};
+use super::{Computed, Model, NodeKind, State};
 use crate::config::Kind;
 use crate::util::absolute;
 use crate::Result;
 
 const LABEL_WIDTH: usize = 16;
 const TEXT_PREFIX: u16 = 2 + LABEL_WIDTH as u16 + 2;
-const KINDS: [Kind; 3] = [Kind::Executable, Kind::Static, Kind::Shared];
+const KINDS: [Kind; 4] = [Kind::Executable, Kind::Static, Kind::Shared, Kind::Test];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -93,7 +93,7 @@ struct App<'a> {
     includes: TreeView,
     focus: usize,
     cursor: usize,
-    field_rects: Vec<(Rect, Field)>,
+    field_rects: Vec<(Rect, usize, Field)>,
     tab_rects: Vec<Rect>,
     review_scroll: u16,
     write_button: Rect,
@@ -196,8 +196,11 @@ impl<'a> App<'a> {
         let count = model.nodes.len();
         let mut expanded = vec![false; count];
         expanded[0] = true;
-        for index in 0..count {
+        for index in 1..count {
             let node = &model.nodes[index];
+            if node.depth == 1 && (model.choice[index] == Some(true) || model.include[index]) {
+                expanded[index] = true;
+            }
             if model.choice[index] == Some(false) && node.depth >= 2 {
                 let mut ancestor = node.parent;
                 while ancestor != 0 {
@@ -330,7 +333,9 @@ impl<'a> App<'a> {
     fn is_visible(&self, index: usize) -> bool {
         let node = &self.model.nodes[index];
         match (self.tab, node.kind) {
-            (Tab::Includes, NodeKind::Dir) => !node.locked && node.hdr_total > 0,
+            (Tab::Includes, NodeKind::Dir) => {
+                !node.locked && (node.hdr_total > 0 || self.model.include[index])
+            }
             (Tab::Includes, NodeKind::Header) => true,
             (Tab::Includes, NodeKind::Source) => false,
             (_, NodeKind::Dir) => node.locked || node.src_total > 0,
@@ -421,7 +426,13 @@ impl<'a> App<'a> {
             KeyCode::Backspace => {
                 text.pop();
             }
-            KeyCode::Char(typed) => text.push(typed),
+            KeyCode::Char(typed)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                text.push(typed);
+            }
             _ => {}
         }
         None
@@ -472,10 +483,14 @@ impl<'a> App<'a> {
 
     fn on_project_key(&mut self, key: KeyEvent) {
         let field = self.focused_field();
+        let ctrl_or_alt = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match key.code {
             KeyCode::Up => self.move_focus(-1),
             KeyCode::Down => self.move_focus(1),
             KeyCode::Enter if field.is_text() => self.move_focus(1),
+            KeyCode::Char(_) if field.is_text() && ctrl_or_alt => {}
             code if field.is_text() => self.edit_text(field, code),
             KeyCode::Left => self.change_field(field, -1),
             KeyCode::Enter => match field {
@@ -525,10 +540,10 @@ impl<'a> App<'a> {
                 let current = KINDS
                     .iter()
                     .position(|kind| *kind == self.model.kind)
-                    .unwrap();
+                    .unwrap_or(0);
                 let next = (current as isize + step).rem_euclid(KINDS.len() as isize);
                 self.model.kind = KINDS[next as usize];
-                self.model.export = self.model.kind != Kind::Executable;
+                self.model.export = !matches!(self.model.kind, Kind::Executable | Kind::Test);
             }
             Field::Export => self.model.export = !self.model.export,
             Field::Dep(index) => {
@@ -630,7 +645,7 @@ impl<'a> App<'a> {
             Tab::Sources | Tab::Includes => self.move_cursor(step),
             Tab::Review => self.review_scroll = (self.review_scroll as isize + step).max(0) as u16,
             Tab::Registry => self.registry.scroll(step),
-            Tab::Project => {}
+            Tab::Project => self.move_focus(step.signum()),
         }
     }
 
@@ -646,21 +661,20 @@ impl<'a> App<'a> {
         match self.tab {
             Tab::Project => self.click_project(position),
             Tab::Sources | Tab::Includes => self.click_tree(position),
-            Tab::Registry => {}
+            Tab::Registry => self.registry.click(position, &mut self.model.deps),
             Tab::Review => return self.write_button.contains(position).then_some(true),
         }
         None
     }
 
     fn click_project(&mut self, position: Position) {
-        let Some(index) = self
+        let Some(&(rect, index, field)) = self
             .field_rects
             .iter()
-            .position(|(rect, _)| rect.contains(position))
+            .find(|(rect, _, _)| rect.contains(position))
         else {
             return;
         };
-        let (rect, field) = self.field_rects[index];
         self.focus = index;
         self.reset_cursor();
         if field.is_text() {
@@ -760,7 +774,7 @@ impl<'a> App<'a> {
             title.clone(),
             Style::new().add_modifier(Modifier::BOLD),
         )];
-        let mut x = area.x + title.len() as u16;
+        let mut x = area.x + title.chars().count() as u16;
         for (position, tab) in Tab::ALL.iter().enumerate() {
             let label = format!(" {} {} ", position + 1, tab.title());
             let width = label.len() as u16;
@@ -788,26 +802,37 @@ impl<'a> App<'a> {
         let inner = block.inner(left);
         frame.render_widget(block, left);
         self.field_rects.clear();
-        let mut y = inner.y;
+        let mut rows: Vec<(u16, usize, Field)> = Vec::new();
+        let mut row = 0u16;
         for (position, field) in self.fields().into_iter().enumerate() {
-            y += match field {
+            row += match field {
                 Field::Export | Field::Register => 1,
                 Field::Dep(0) => 2,
                 _ => 0,
             };
-            if y >= inner.bottom() {
-                break;
-            }
-            if field == Field::Dep(0) {
-                let heading = Rect::new(inner.x, y - 1, inner.width, 1);
+            rows.push((row, position, field));
+            row += 1;
+        }
+        let focused_row = rows
+            .iter()
+            .find(|(_, pos, _)| *pos == self.focus)
+            .map_or(0, |&(r, _, _)| r);
+        let scroll = (focused_row + 1).saturating_sub(inner.height);
+        for (row, position, field) in rows {
+            if field == Field::Dep(0) && row > scroll && row - 1 - scroll < inner.height {
+                let heading = Rect::new(inner.x, inner.y + row - 1 - scroll, inner.width, 1);
                 frame.render_widget(
                     Paragraph::new("Dependencies: Space toggle, Enter configure")
                         .style(Style::new().fg(Color::Gray)),
                     heading,
                 );
             }
+            if row < scroll || row - scroll >= inner.height {
+                continue;
+            }
+            let y = inner.y + row - scroll;
             let rect = Rect::new(inner.x, y, inner.width, 1);
-            self.field_rects.push((rect, field));
+            self.field_rects.push((rect, position, field));
             let focused = position == self.focus;
             frame.render_widget(Paragraph::new(self.field_line(field, focused)), rect);
             if focused && field.is_text() {
@@ -816,7 +841,6 @@ impl<'a> App<'a> {
                     rect.y,
                 ));
             }
-            y += 1;
         }
         let nodes = &self.model.nodes;
         let summary = vec![
@@ -869,7 +893,7 @@ impl<'a> App<'a> {
                         Color::DarkGray
                     };
                     spans.push(Span::styled(
-                        format!("{glyph}{}   ", kind_name(kind)),
+                        format!("{glyph}{}   ", kind.name()),
                         Style::new().fg(color),
                     ));
                 }
@@ -1232,6 +1256,32 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
         assert!(app.confirm_quit);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn test_kind_and_ctrl_keys_and_registry_left_behave_cleanly() {
+        let root = std::env::temp_dir().join(format!("nomake_tui_bugs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/t.cpp"), "int main() {}").unwrap();
+        std::fs::write(
+            root.join("nomake.toml"),
+            "[package]\nname = \"t\"\ntype = \"test\"\n",
+        )
+        .unwrap();
+        let mut model = Model::open(&root, None).unwrap();
+        assert_eq!(model.kind, Kind::Test);
+        let mut app = App::new(&mut model);
+        // Ctrl+x while typing in Name must not insert 'x'.
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert_eq!(app.model.name, "t");
+        // Move to Kind and cycle without panicking.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.model.kind, Kind::Executable);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.model.kind, Kind::Test);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

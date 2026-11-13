@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use crate::config::{Dependency, Kind, Manifest, Sources, Toolchain};
+use crate::config::{Dependency, Kind, Manifest, Os, Sources, Toolchain};
 use crate::registry;
 use crate::util::{absolute, glob, matches, rel_str};
 use crate::Result;
@@ -68,25 +68,48 @@ impl Workspace {
     }
 }
 
-pub fn load(root: &Path) -> Result<Workspace> {
-    load_roots(root, std::slice::from_ref(&root.to_path_buf()))
+pub fn load(root: &Path, os: Os) -> Result<Workspace> {
+    load_roots(root, std::slice::from_ref(&root.to_path_buf()), os)
 }
 
 /// Loads several root packages into one set of packages, so a shared dependency exists once with the
 /// features and link kind every member asks for. The lock file lives in `lock_dir`.
-pub fn load_roots(lock_dir: &Path, roots: &[PathBuf]) -> Result<Workspace> {
-    load_with(lock_dir, roots, None)
+pub fn load_roots(lock_dir: &Path, roots: &[PathBuf], os: Os) -> Result<Workspace> {
+    load_with(lock_dir, roots, None, os)
 }
 
 /// Re-resolves registry dependencies against the newest registry (all of them when `names` is empty) and rewrites `nomake.lock`.
 pub fn update(root: &Path, names: &[String]) -> Result<()> {
-    load_with(root, std::slice::from_ref(&root.to_path_buf()), Some(names)).map(|_| ())
+    load_with(
+        root,
+        std::slice::from_ref(&root.to_path_buf()),
+        Some(names),
+        Os::host(),
+    )
+    .map(|_| ())
 }
 
-fn load_with(lock_dir: &Path, roots: &[PathBuf], update: Option<&[String]>) -> Result<Workspace> {
+fn load_with(
+    lock_dir: &Path,
+    roots: &[PathBuf],
+    update: Option<&[String]>,
+    os: Os,
+) -> Result<Workspace> {
     let mut resolver = registry::Resolver::new(lock_dir, update)?;
-    let (manifests, links) = read_manifests(roots, &mut resolver)?;
+    let (manifests, links) = read_manifests(roots, &mut resolver, os)?;
     resolver.fetch()?;
+    // Lock what the other targets need as well, so switching targets neither drops nor re-resolves entries.
+    // Their sources are fetched when they are built; a problem there only matters to `nomake update`.
+    resolver.lock_only();
+    for other in [Os::host(), Os::Emscripten]
+        .into_iter()
+        .filter(|&other| other != os)
+    {
+        let locked = read_manifests(roots, &mut resolver, other);
+        if update.is_some() {
+            locked?;
+        }
+    }
     resolver.save()?;
     let mut loader = Loader {
         manifests,
@@ -147,6 +170,7 @@ fn locate(
 fn read_manifests(
     roots: &[PathBuf],
     resolver: &mut registry::Resolver,
+    os: Os,
 ) -> Result<(HashMap<PathBuf, Manifest>, Links)> {
     let mut all = HashMap::new();
     let mut links = Links::new();
@@ -168,7 +192,7 @@ fn read_manifests(
                         dir.display()
                     );
                 }
-                Ok((dir, Manifest::load_resolved(&file)?))
+                Ok((dir, Manifest::load_resolved(&file, os)?))
             })
             .collect::<Result<Vec<_>>>()?;
         level = Vec::new();
@@ -231,7 +255,7 @@ impl Wanted {
             if from_root {
                 self.root_link = Some(kind);
             }
-            self.links.insert(format!("{kind:?}").to_lowercase());
+            self.links.insert(kind.name().to_string());
         }
     }
 
@@ -462,7 +486,7 @@ mod tests {
         let app = |dependencies: &str| {
             write(&root, "app/nomake.toml", &format!("[package]\nname = \"app\"\n[dependencies]\nmid = {{ path = \"../mid\" }}\n{dependencies}"));
             write(&root, "app/main.c", "");
-            let ws = load(&root.join("app")).unwrap();
+            let ws = load(&root.join("app"), Os::host()).unwrap();
             source_names(&ws.pkgs[0])
         };
         // Only mid asks for lib: no defaults, just `c`.
@@ -473,7 +497,7 @@ mod tests {
             ["a.c", "b.c", "base.c", "c.c"]
         );
         write(&root, "app/nomake.toml", "[package]\nname = \"app\"\n[dependencies]\nlib = { path = \"../lib\", features = [\"nope\"] }\n");
-        assert!(load(&root.join("app")).is_err());
+        assert!(load(&root.join("app"), Os::host()).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -496,7 +520,7 @@ mod tests {
                 "app/nomake.toml",
                 &format!("[package]\nname = \"app\"\n[dependencies]\n{dependencies}"),
             );
-            load(&root.join("app"))
+            load(&root.join("app"), Os::host())
         };
         let on = "ui = { path = \"../ui\", features = [\"sdl\"] }\n";
         assert!(app(on).is_err());

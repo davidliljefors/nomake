@@ -14,54 +14,45 @@ mod state;
 mod testrun;
 mod toolchain;
 mod util;
+mod vs;
 mod workspace;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 use commands::BuildOpts;
-use config::Kind;
+use config::{Kind, Os};
 use toolchain::Arch;
 
 const USAGE: &str = "\
-nomake - fast C/C++ build engine
+nomake - C/C++ build tool
 
 USAGE:
     nomake <command> [options]
 
 COMMANDS:
     new <name> [--lib|--shared]  Create a new project
-    init [-y] [--lib|--shared]   Interactively write nomake.toml for the current directory
-    configure                    Edit the existing nomake.toml and its dependencies interactively
-    add <name>[@version]         Add a registry library to nomake.toml and lock it
-    update [name...]             Move locked registry libraries to the newest versions
-    list | search | info         Show locked libraries, search the registry, show a library's versions
-    cache clean                  Delete the shared source cache
-    build [-r] [-a ARCH] [-j N]  Build the project
-    run [-r] [-a ARCH] [-- args] Build and run the executable
-    test [-r] [-a ARCH] [-- args] Build and run the packages of type \"test\" (exit code 0 = pass)
-    compdb [-r] [-a ARCH]        Write compile_commands.json
-    vs [-a ARCH,...]             Write a Visual Studio solution to build/vs/
-    clean [-r] [-a ARCH]         Remove build/ (keeps build/vs/), or just one configuration
-
-WORKSPACES:
-    A nomake.toml with a [workspace] table (members = [\"libs/*\", \"app\"]) makes build, run, clean,
-    compdb and vs act on every member. Name members to pick some: `nomake build app tests`,
-    `nomake run app`; without a name `run` starts the first executable in `members`. `build` skips members of type \"test\" unless named; `nomake test` runs them
-    (`nomake test core`, each with a timeout from its [test] table, default 60s). compile_commands.json
-    and the solution are written at the root.
+    init [-y] [--lib|--shared]   Create nomake.toml for current directory
+    configure                    Interactive project and dependency configuration
+    add <name>[@version]         Add a registry dependency
+    update [name...]             Update locked dependencies
+    list | search | info         Inspect registry dependencies
+    cache clean                  Remove cached dependency sources
+    build [-r] [-a ARCH] [-j N]  Build project
+    run [-r] [-a ARCH] [-- args] Build and run executable
+    test [-r] [-a ARCH] [-- args] Build and run tests
+    compdb [-r] [-a ARCH]        Generate compile_commands.json
+    vs [-a ARCH,...]             Generate Visual Studio solution in build/vs/
+    clean [-r] [-a ARCH]         Remove build artifacts
 
 OPTIONS:
-    -r, --release   Optimised build
-    -a, --arch ARCH Target architecture: x64, x86 or arm64 (default: this machine)
-                    `vs` also takes several: -a x64,arm64
-    -j, --jobs N    Parallel jobs (default: all cores)
-    -v, --verbose   Print every command
-    -d explain      Say why each step is considered out of date
-    -d stats        Print how long each phase took
-    -y, --yes       Accept all defaults (init)
-    -V, --version   Print the version
-
-Output goes to build/<arch>-<debug|release>.
+    -r, --release    Release build
+    -a, --arch ARCH  Target architecture: x64, x86, arm64, wasm32
+    -j, --jobs N     Parallel jobs (default: all cores)
+    -v, --verbose    Print executed commands
+    -d explain       Explain why targets rebuild
+    -d stats         Print phase timing
+    -y, --yes        Accept defaults in init
+    -V, --version    Print version
 ";
 
 #[derive(Default)]
@@ -82,7 +73,7 @@ fn parse_archs(text: &str) -> Result<Vec<Arch>> {
     for name in text.split(',') {
         match Arch::parse(name) {
             Some(arch) => archs.push(arch),
-            None => bail!("unknown architecture '{name}' (expected x64, x86 or arm64)"),
+            None => bail!("unknown architecture '{name}' (expected x64, x86, arm64 or wasm32)"),
         }
     }
     Ok(archs)
@@ -140,9 +131,10 @@ fn real_main() -> Result<i32> {
     let args = parse(argv.collect())?;
     let here = util::absolute(std::path::Path::new("."));
     let workspace = match command.as_str() {
-        "build" | "b" | "run" | "r" | "test" | "t" | "clean" | "compdb" | "vs" => {
-            workspace::find(&here)?
-        }
+        "build" | "b" | "run" | "r" | "test" | "t" | "clean" | "compdb" | "vs" => workspace::find(
+            &here,
+            args.archs.first().map_or(Os::host(), |arch| arch.os()),
+        )?,
         _ => None,
     };
     if command == "vs" {
@@ -154,7 +146,7 @@ fn real_main() -> Result<i32> {
         if let Some(root) = &workspace {
             return workspace::solution(root, &archs).map(|_| 0);
         }
-        return toolchain::vs::generate(&archs).map(|_| 0);
+        return vs::generate(&archs).map(|_| 0);
     }
     let arch = single_arch(&args)?;
     let opts = BuildOpts {

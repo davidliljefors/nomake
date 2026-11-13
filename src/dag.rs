@@ -695,7 +695,9 @@ pub fn build(
             bail!("package '{}' has no source files", pkg.name);
         }
         if !objs.is_empty() {
-            let (file, link_file) = tc.artifact(pkg.kind, &pkg.name);
+            let (file, link_file) = tc
+                .artifact(pkg.kind, &pkg.name)
+                .map_err(|e| format!("package '{}': {e}", pkg.name))?;
             let out = out_dir.join(file);
             let node = if pkg.kind == Kind::Static {
                 Node {
@@ -736,13 +738,19 @@ pub fn build(
                     sys_libs.extend(ws.pkgs[dep].libs.iter().cloned());
                     flags.extend(ws.pkgs[dep].link_flags.iter().cloned());
                 }
+                inputs.extend(tc.link_inputs(&flags, root_dir));
                 // A separate import library is what dependents consume, and it only changes when the exports do.
                 let implib = pkg.kind == Kind::Shared && tc.linker.is_some();
-                let outputs = if implib {
+                let mut outputs = if implib {
                     vec![out_dir.join(&link_file), out.clone()]
                 } else {
                     vec![out.clone()]
                 };
+                outputs.extend(
+                    tc.side_outputs(&pkg.name, &flags)
+                        .into_iter()
+                        .map(|file| out_dir.join(file)),
+                );
                 Node {
                     kind: NodeKind::Link,
                     desc: format!("LINK {}", pkg.name),
@@ -783,18 +791,18 @@ pub fn build(
     }
 
     let root = ws.root();
-    let target = out_dir.join(tc.artifact(root.kind, &root.name).0);
+    let target = out_dir.join(tc.artifact(root.kind, &root.name)?.0);
     let targets = ws
         .roots
         .iter()
         .map(|&idx| {
             let pkg = &ws.pkgs[idx];
-            (
+            Ok((
                 pkg.root.clone(),
-                out_dir.join(tc.artifact(pkg.kind, &pkg.name).0),
-            )
+                out_dir.join(tc.artifact(pkg.kind, &pkg.name)?.0),
+            ))
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     let mut dependents = vec![Vec::new(); nodes.len()];
     for (idx, node) in nodes.iter().enumerate() {
@@ -818,6 +826,7 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Os;
     use std::fs;
 
     fn lib(root: &Path, name: &str, deps: &str) {
@@ -844,7 +853,7 @@ mod tests {
             "hidden = { path = \"../hidden\" }\nshown = { path = \"../shown\", public = true }",
         );
         lib(&root, "app", "mid = { path = \"../mid\" }");
-        let ws = crate::scanner::load(&root.join("app")).unwrap();
+        let ws = crate::scanner::load(&root.join("app"), Os::host()).unwrap();
         let app = ws.pkgs.len() - 1;
         let (includes, _) = compile_scope(&ws, app, &root.join("gen"));
         let has = |name: &str| {
@@ -881,10 +890,11 @@ mod tests {
                 .collect();
             (includes, linked.join(" "))
         };
-        let alone = crate::scanner::load(&root.join("app")).unwrap();
+        let alone = crate::scanner::load(&root.join("app"), Os::host()).unwrap();
         // Loading zed first gives it the lower package index.
         let with_zed_first =
-            crate::scanner::load_roots(&root, &[root.join("zed"), root.join("app")]).unwrap();
+            crate::scanner::load_roots(&root, &[root.join("zed"), root.join("app")], Os::host())
+                .unwrap();
         assert_eq!(scope(&alone), scope(&with_zed_first));
         fs::remove_dir_all(root).unwrap();
     }
@@ -913,8 +923,8 @@ mod tests {
         fs::write(root.join("app/data/a.x"), "").unwrap();
         fs::write(root.join("app/data/b.x"), "").unwrap();
 
-        let ws = crate::scanner::load(&root.join("app")).unwrap();
-        let clang = Toolchain::for_tests(crate::toolchain::Family::Clang);
+        let ws = crate::scanner::load(&root.join("app"), Os::host()).unwrap();
+        let clang = Toolchain::for_tests(Family::Clang);
         let graph = build(&ws, &clang, false, &root, &root.join("build")).unwrap();
 
         let gens: Vec<&Node> = graph
@@ -963,11 +973,11 @@ mod tests {
         .unwrap();
         fs::write(root.join("src/main.cpp"), "").unwrap();
         fs::write(root.join("src/util.c"), "").unwrap();
-        let ws = crate::scanner::load(&root).unwrap();
+        let ws = crate::scanner::load(&root, Os::host()).unwrap();
         let out = root.join("build");
 
         // A missing header is reported instead of failing inside the compiler.
-        let clang = Toolchain::for_tests(crate::toolchain::Family::Clang);
+        let clang = Toolchain::for_tests(Family::Clang);
         assert!(build(&ws, &clang, false, &root, &out).is_err());
         fs::write(root.join("src/pch.h"), "").unwrap();
 
@@ -1000,11 +1010,11 @@ mod tests {
                 && c.deps.iter().all(|edge| edge.node != pch)
         );
 
-        let gcc = Toolchain::for_tests(crate::toolchain::Family::Gcc);
+        let gcc = Toolchain::for_tests(Family::Gcc);
         assert!(build(&ws, &gcc, false, &root, &out).is_err());
 
         // MSVC-style compilers precompile through a stub source and link its object.
-        let msvc = Toolchain::for_tests(crate::toolchain::Family::Msvc);
+        let msvc = Toolchain::for_tests(Family::Msvc);
         let graph = build(&ws, &msvc, false, &root, &out).unwrap();
         let pch = graph
             .nodes
@@ -1031,6 +1041,52 @@ mod tests {
             .inputs
             .iter()
             .any(|input| input.to_string_lossy().ends_with("pch.h.obj")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn emscripten_graph_tracks_side_outputs_and_rejects_shared_libs() {
+        let root = std::env::temp_dir().join(format!("nomake_wasm_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let app = root.join("app");
+        fs::create_dir_all(app.join("src")).unwrap();
+        fs::write(app.join("src/main.cpp"), "int main() { return 0; }").unwrap();
+        fs::write(
+            app.join("nomake.toml"),
+            "[package]\nname = \"app\"\ntype = \"executable\"\n\
+             [target.emscripten.build]\nlink_flags = [\"-O3\", \"--preload-file\", \"assets\"]\n",
+        )
+        .unwrap();
+        let ws = crate::scanner::load(&app, Os::Emscripten).unwrap();
+        let tc = Toolchain::for_tests(Family::Emscripten);
+        let graph = build(&ws, &tc, true, &app, &root.join("out")).unwrap();
+
+        let link = graph
+            .nodes
+            .iter()
+            .find(|n| n.desc.starts_with("LINK"))
+            .unwrap();
+        let names: Vec<_> = link
+            .outputs
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["app.html", "app.js", "app.wasm", "app.data"]);
+        let link_args = link.args();
+        assert!(
+            link_args.contains(&"-O3".to_string()) && link_args.contains(&"assets".to_string())
+        );
+
+        fs::write(
+            app.join("nomake.toml"),
+            "[package]\nname = \"app\"\ntype = \"shared\"\n",
+        )
+        .unwrap();
+        let ws = crate::scanner::load(&app, Os::Emscripten).unwrap();
+        let error = build(&ws, &tc, false, &app, &root.join("out"))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("cannot build shared libraries"));
         fs::remove_dir_all(root).unwrap();
     }
 }

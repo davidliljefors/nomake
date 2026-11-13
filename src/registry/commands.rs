@@ -65,7 +65,7 @@ fn add(root: &Path, spec: &str) -> Result<()> {
     model.write()?;
     println!("nomake: added {name} = {{ version = \"{requirement}\" }}");
     // Resolving the project locks the new dependency and fetches its sources.
-    crate::scanner::load(root).map(|_| ())
+    crate::scanner::load(root, crate::config::Os::host()).map(|_| ())
 }
 
 fn list(root: &Path) -> Result<()> {

@@ -1,11 +1,11 @@
 # nomake
 
-Build tool for C and C++. Write a short `nomake.toml` and nomake finds the sources, works out the dependency graph and builds in parallel.
+C/C++ build tool. Write a small `nomake.toml` and `nomake` scans sources, resolves dependencies, and builds in parallel.
 
-- Works with clang, clang-cl, cl and gcc
-- Builds x64, x86 and ARM64 from one project
-- Dependencies are plain folders or libraries from a registry
-- Header dependencies are tracked per file
+- Supports `clang`, `clang-cl`, `cl`, `gcc`, and `em++` (Emscripten)
+- Targets `x64`, `x86`, `arm64`, and `wasm32`
+- Folder and registry dependencies with lockfile (`nomake.lock`)
+- Incremental rebuilds with header dependency tracking
 
 ## Install
 
@@ -13,7 +13,7 @@ Build tool for C and C++. Write a short `nomake.toml` and nomake finds the sourc
 cargo install --path .
 ```
 
-## Usage
+## Quick start
 
 ```
 nomake new hello
@@ -21,43 +21,42 @@ cd hello
 nomake run
 ```
 
-For an existing source tree, run `nomake init` in its root.
+For an existing project, run `nomake init`.
 
-| Command | |
+| Command | Description |
 | --- | --- |
-| `nomake new <name> [--lib\|--shared]` | create a project |
-| `nomake init [-y]` | write a `nomake.toml` for the current folder |
-| `nomake configure` | edit the existing `nomake.toml` |
-| `nomake build` | build |
-| `nomake run [-- args]` | build and run the executable |
-| `nomake clean` | delete `build/` (keeps `build/vs/`) |
-| `nomake compdb` | write `compile_commands.json` |
-| `nomake vs` | write a Visual Studio solution to `build/vs/` |
-| `nomake add <name>[@version]` | add a registry library and lock it |
-| `nomake update [name...]` | move locked libraries to the newest allowed version |
-| `nomake list` | show locked libraries |
-| `nomake search [text]` | search the registry |
-| `nomake info <name>` | show a library's versions, source and features |
-| `nomake cache clean` | delete the shared source cache |
+| `nomake new <name> [--lib\|--shared]` | Create a new project |
+| `nomake init [-y]` | Generate `nomake.toml` for the current directory |
+| `nomake configure` | Interactive project and dependency editor |
+| `nomake build` | Build project |
+| `nomake run [-- args]` | Build and run executable |
+| `nomake test [-- args]` | Build and run `type = "test"` packages |
+| `nomake clean` | Remove `build/` (keeps `build/vs/`) |
+| `nomake compdb` | Write `compile_commands.json` |
+| `nomake vs` | Write a Visual Studio solution to `build/vs/` |
+| `nomake add <name>[@version]` | Add and lock a registry dependency |
+| `nomake update [name...]` | Update locked dependencies |
+| `nomake list` | List locked dependencies |
+| `nomake search [text]` | Search the registry |
+| `nomake info <name>` | Show package versions, source, and features |
+| `nomake cache clean` | Remove cached dependency sources |
 
-| Option | |
+| Option | Description |
 | --- | --- |
-| `-r`, `--release` | optimized build |
-| `-a`, `--arch ARCH` | `x64`, `x86` or `arm64`, default is the host. `vs` takes several |
-| `-j`, `--jobs N` | parallel jobs, default is all cores |
-| `-v`, `--verbose` | print every command |
-| `-d explain` | say why each step is out of date |
-| `-d stats` | print how long each phase took |
-| `-V`, `--version` | print the version |
+| `-r`, `--release` | Release build |
+| `-a`, `--arch ARCH` | `x64`, `x86`, `arm64`, or `wasm32` (default: host; `vs` accepts a comma list) |
+| `-j`, `--jobs N` | Parallel jobs (default: all cores) |
+| `-v`, `--verbose` | Print executed commands |
+| `-d explain` | Print why targets rebuild |
+| `-d stats` | Print phase timing |
+| `-V`, `--version` | Print version |
 
 ```
-nomake build -r -a arm64    # build/arm64-release/
-nomake clean -a x86 -r      # only removes x86-release
+nomake build -r -a arm64    # outputs to build/arm64-release/
+nomake clean -a x86 -r      # removes only build/x86-release/
 ```
 
-Each architecture and profile gets its own folder under `build/`. MSVC and clang-cl run `vcvarsall.bat` for the architecture, clang++ gets `--target`. g++ only does `x86` on an x64 host. For anything else set a cross compiler with `CXX`.
-
-## nomake.toml
+## `nomake.toml`
 
 Only `[package]` is required.
 
@@ -65,27 +64,27 @@ Only `[package]` is required.
 [package]
 name = "app"
 version = "0.1.0"
-type = "executable"    # executable | static | shared
+type = "executable"             # executable | static | shared | test
 cxx_standard = 20
 
 [sources]
-dirs = ["src"]    # scanned recursively, src/ by default
-files = ["extra/*.cpp"]    # globs
+dirs = ["src"]                  # recursive; defaults to ["src"]
+files = ["extra/*.cpp"]         # globs
 exclude = ["src/experimental/**"]
 
 [include]
-public = ["include"]    # visible to dependents
-private = ["src"]       # defaults: include/ public, src/ private
+public = ["include"]            # exported to dependents
+private = ["src"]               # defaults: include/ public, src/ private
 
 [build]
 defines = ["FOO=1"]
-public_defines = ["USE_FOO"]    # also applied to dependents
-flags = ["-Wall"]               # compiler driver, last on the command line
-link_flags = []                 # linker, last on the command line
+public_defines = ["USE_FOO"]    # exported to dependents
+flags = ["-Wall"]               # appended to compile commands
+link_flags = []                 # appended to link commands
 libs = ["user32"]
-crt = "dynamic"                 # or "static", one value for the whole build
-subsystem = "console"           # or "windows", link.exe and lld-link only
-pch = "src/pch.h"               # clang++, cl and clang-cl
+crt = "dynamic"                 # dynamic (default) | static
+subsystem = "console"           # console | windows (MSVC/lld-link)
+pch = "src/pch.h"               # precompiled header (clang++, cl, clang-cl)
 
 [toolchain]
 cxx = "clang++"
@@ -95,9 +94,9 @@ ar = "llvm-ar"
 mathx = { path = "deps/mathx" }
 ```
 
-Dependencies build first and their libraries and link flags go into the final link. Headers and `public_defines` are not inherited. Mark a dependency `public = true` to pass them on.
+Mark a dependency `public = true` to re-export its `include.public` and `public_defines`.
 
-### Generated files
+### Code generation
 
 ```toml
 [[generate]]
@@ -107,9 +106,9 @@ inputs = ["assets/*.bin"]
 outputs = ["{stem}.cpp"]
 ```
 
-Runs once per input, or once for all with `batch = true`. Placeholders are `{input}`, `{output}`, `{out_dir}`, `{stem}` and `{depfile}`. Outputs go to `build/<arch>-<profile>/gen/<package>/`, which is on the include path. Generated `.cpp` files are compiled.
+Runs once per input (or once for all inputs with `batch = true`). Placeholders: `{input}`, `{output}`, `{out_dir}`, `{stem}`, `{depfile}`. Outputs are written to `build/<arch>-<profile>/gen/<package>/` (added to the include path), and generated `.c`/`.cpp` files are compiled automatically.
 
-A step can use an executable package as a `tool` instead of a `command`:
+To run an executable dependency as a generator tool:
 
 ```toml
 [dependencies]
@@ -121,11 +120,11 @@ inputs = ["schema/*.in"]
 outputs = ["{stem}.gen.hpp", "{stem}.gen.cpp"]
 ```
 
-It is called as `tool --out-dir <gen dir> --depfile <file> -I<dir>... <input>` and must write a Makefile-style depfile (`out: dep dep ...`) listing other files it read. With `command`, add `{depfile}` to the arguments to opt in.
+`nomake` invokes `tool --out-dir <gen_dir> --depfile <file> -I<dir>... <input>`.
 
-### Platform tables
+### Target tables
 
-`[target.<os>]` adds to the base manifest. Names are `windows`, `macos`, `linux` and `unix` (macOS and Linux).
+`[target.<os>]` merges OS-specific settings (`sources`, `include`, `build`, `dependencies`, `feature`, `generate`) into the manifest. Supported targets: `windows`, `macos`, `linux`, `emscripten`, and `unix` (all non-Windows targets, including `emscripten`).
 
 ```toml
 [sources]
@@ -138,10 +137,8 @@ sources.files = ["builds/windows/ftsystem.c"]
 sources.files = ["builds/unix/ftsystem.c"]
 
 [target.windows.dependencies]
-imgui = { public = true }    # merged into the entry with the same name
+imgui = { public = true }
 ```
-
-Tables take `sources`, `include`, `build` and `dependencies`. If any table sets `sources` or `include`, the defaults are off on every OS.
 
 ### Features
 
@@ -152,57 +149,68 @@ default = ["dx11"]
 [feature.dx11]
 sources.files = ["backends/imgui_impl_dx11.cpp"]
 build.libs = ["d3d11"]
-peer = ["sdl3"]    # use a root dependency's headers and defines, no linking
+peer = ["sdl3"]                 # use headers/defines from root's sdl3 dependency
 
-[target.windows.feature.dx11]    # same feature, this OS only
+[target.windows.feature.dx11]
 build.defines = ["IMGUI_DX11"]
 ```
 
 ```toml
-# in a dependent
+[dependencies]
 imgui = { version = "1", features = ["opengl"], default-features = false }
 ```
 
-Features work on `path` dependencies too. Requests from different dependents are added up.
-
-### C runtime
-
-On Windows `dynamic` is `/MD` (`/MDd` in debug) and `static` is `/MT`. On Linux `static` links with `-static`. Every package in a build must agree on `crt`.
-
 ## Registry
 
-A registry is a git repository of recipes at `<name>/<version>/nomake.toml`. A recipe is a normal `nomake.toml` plus a `[source]` table with a git url and a full commit hash. Sources are cached and shared by all projects.
+Registry packages live at `<name>/<version>/nomake.toml` with a `[source]` table (`git` URL and 40-char commit `rev`). Resolved versions are recorded in `nomake.lock` and sources are cached under `NOMAKE_HOME` (`%LOCALAPPDATA%\nomake` or `~/.cache/nomake`).
 
 ```
-nomake add lua      # writes lua = { version = "5.4" } and locks it
-nomake update lua   # newest 5.4.x, never 5.5
+nomake add lua      # adds lua = { version = "5.4" } and writes nomake.lock
+nomake update lua   # updates within 5.4.x
 ```
 
-Commit `nomake.lock`. Only the root project's lock is used, so list a library in the root `nomake.toml` to pick its version.
+Libraries that support both linkage modes set `type = ["shared", "static"]` (with optional `[build] shared_defines`); dependents can select `link = "static"` or `link = "shared"`.
 
-A recipe can offer both builds with `type = ["shared", "static"]` (first is the default) and `[build] shared_defines` for DLL-only defines. A dependent picks with `link = "static"`.
-
-| Variable | |
-|---|---|
-| `NOMAKE_HOME` | cache folder, default `%LOCALAPPDATA%\nomake` or `~/.cache/nomake` |
-| `NOMAKE_REGISTRY` | local registry folder, for writing recipes |
+| Environment variable | Description |
+| --- | --- |
+| `NOMAKE_HOME` | Cache directory (`%LOCALAPPDATA%\nomake` or `~/.cache/nomake`) |
+| `NOMAKE_REGISTRY` | Local registry path override |
 
 ## Compiler selection
 
 1. `CXX` environment variable
 2. `[toolchain] cxx` in the root `nomake.toml`
-3. Windows: `clang++`, then `cl`. Elsewhere: `clang++`, `g++`, then `c++`
+3. Default per target — `wasm32`: `em++`; Windows: `clang++`, `cl`, `g++`; Unix: `clang++`, `g++`, `c++`
 
-## Visual Studio
+## Emscripten (`-a wasm32`)
+
+Activate `emsdk` so `em++` and `emar` are on `PATH`, then build with `-a wasm32`:
+
+```
+nomake build -a wasm32
+nomake run -a wasm32
+nomake test -a wasm32
+```
+
+Executables output `build/wasm32-<profile>/<name>.html` alongside `<name>.js` and `<name>.wasm` (plus `<name>.data` when `--preload-file` is used). `nomake run -a wasm32` and `nomake test -a wasm32` execute `<name>.js` with `node`; serve `<name>.html` over HTTP for browser apps.
+
+```toml
+[target.emscripten.build]
+link_flags = ["--embed-file", "assets", "-sALLOW_MEMORY_GROWTH=1"]
+```
+
+Files passed to `--shell-file`, `--pre-js`, `--post-js`, `--js-library`, `--embed-file`, and `--preload-file` are tracked as link inputs so edits trigger relinking. Shared libraries are not supported on Emscripten; use `type = "static"` or `link = "static"`.
+
+## Visual Studio & Workspaces
 
 ```
 nomake vs
 nomake vs -a x64,arm64
 ```
 
-Writes `build/vs/<name>.sln` with Debug and Release. They are NMake projects, so build and debug call back into nomake.
+Generates an NMake-based solution in `build/vs/<name>.sln` that delegates build/clean to `nomake`.
 
-## Workspaces
+Multi-package repositories can define `[workspace]` in the root `nomake.toml`:
 
 ```toml
 [workspace]
@@ -210,20 +218,22 @@ members = ["my-lib", "my-lib/tests", "tools/*"]
 ```
 
 ```
-nomake build                # every member
-nomake build app tests      # some members
-nomake run app              # without a name: the first executable in `members`
+nomake build                # build all non-test members in a single graph
+nomake build app tests      # build specific members
+nomake run app              # run a member (defaults to first executable)
+nomake test                 # build and run all test members
 ```
 
 ## Examples
 
-| Folder | |
+| Path | Description |
 | --- | --- |
-| [examples/hello](examples/hello) | a single executable |
-| [examples/static-lib](examples/static-lib) | an executable using a static library in `deps/` |
-| [examples/shared-lib](examples/shared-lib) | an executable using a shared library |
-| [examples/options](examples/options) | defines, a language standard and excluding sources |
+| [examples/hello](examples/hello) | Single executable |
+| [examples/static-lib](examples/static-lib) | Executable with a static library in `deps/` |
+| [examples/shared-lib](examples/shared-lib) | Executable with a shared library |
+| [examples/options](examples/options) | Defines, C++ standard, and source exclusions |
+| [examples/emscripten](examples/emscripten) | Native + WebAssembly executable with an embedded file |
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

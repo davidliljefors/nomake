@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
@@ -32,9 +32,9 @@ pub struct RegistryView {
     filter: String,
     cursor: usize,
     list: ListState,
+    list_area: Rect,
     pane: Pane,
     row: usize,
-    /// Recipes read so far, by name and requirement.
     details: HashMap<(String, String), Option<Details>>,
     status: String,
 }
@@ -48,6 +48,7 @@ impl RegistryView {
             filter: String::new(),
             cursor: 0,
             list: ListState::default(),
+            list_area: Rect::default(),
             pane: Pane::List,
             row: 0,
             details: HashMap::new(),
@@ -116,6 +117,20 @@ impl RegistryView {
     pub fn scroll(&mut self, step: isize) {
         if self.pane == Pane::List {
             self.move_cursor(step);
+        } else {
+            self.row = (self.row as isize + step.signum()).max(0) as usize;
+        }
+    }
+
+    pub fn click(&mut self, position: Position, deps: &mut Vec<Dep>) {
+        if !self.list_area.contains(position) {
+            return;
+        }
+        let row = self.list.offset() + (position.y - self.list_area.y) as usize;
+        if row < self.shown().len() {
+            self.pane = Pane::List;
+            self.cursor = row;
+            self.toggle(deps);
         }
     }
 
@@ -148,7 +163,11 @@ impl RegistryView {
                 self.filter.pop();
                 self.cursor = 0;
             }
-            KeyCode::Char(typed) => {
+            KeyCode::Char(typed)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 self.filter.push(typed);
                 self.cursor = 0;
             }
@@ -209,25 +228,21 @@ impl RegistryView {
                         .collect()
                 });
         let rows = FIRST_FEATURE_ROW + features.len();
+        self.row = self.row.min(rows - 1);
         let Some(dep) = deps.iter_mut().find(|dep| dep.key == name) else {
             return;
         };
         match key.code {
             KeyCode::Up => self.row = self.row.saturating_sub(1),
             KeyCode::Down => self.row = (self.row + 1).min(rows - 1),
-            KeyCode::Left | KeyCode::Right if self.row == VERSION_ROW => {
+            KeyCode::Left => self.pane = Pane::List,
+            KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') if self.row == VERSION_ROW => {
                 let at = series
                     .iter()
                     .position(|found| Some(found) == dep.version.as_ref())
                     .unwrap_or(0);
-                let next = if key.code == KeyCode::Right {
-                    (at + 1).min(series.len() - 1)
-                } else {
-                    at.saturating_sub(1)
-                };
-                dep.version = Some(series[next].clone());
+                dep.version = Some(series[(at + 1) % series.len()].clone());
             }
-            KeyCode::Left => self.pane = Pane::List,
             KeyCode::Enter | KeyCode::Char(' ') => match self.row {
                 VERSION_ROW => {}
                 PUBLIC_ROW => dep.public = !dep.public,
@@ -280,6 +295,7 @@ impl RegistryView {
         frame.render_widget(block, area);
         let [search, list_area] =
             Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+        self.list_area = list_area;
         let cursor = if self.pane == Pane::List { "_" } else { "" };
         let hint = if self.filter.is_empty() {
             Span::styled("type to search", Style::new().fg(Color::DarkGray))
@@ -395,7 +411,7 @@ impl RegistryView {
                 ));
                 lines.push(Line::styled(
                     format!(
-                        "  version  {}   (Left/Right: {})",
+                        "  version  {}   (Space/Right: {})",
                         dep.version.as_deref().unwrap_or(""),
                         series.join(", ")
                     ),

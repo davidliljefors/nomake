@@ -68,15 +68,6 @@ fn has_main(path: &Path) -> bool {
         .any(|marker| text.contains(marker))
 }
 
-pub fn kind_name(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Executable => "executable",
-        Kind::Test => "test",
-        Kind::Static => "static",
-        Kind::Shared => "shared",
-    }
-}
-
 fn toml_list(values: &[String]) -> String {
     format!(
         "[{}]",
@@ -427,13 +418,18 @@ impl Model {
         let nodes = scan_tree(root);
         let count = nodes.len();
         let parent_toml = registrable_parent(root);
+        let kind = if manifest.package.is_test() {
+            Kind::Test
+        } else {
+            manifest.package.kind()
+        };
         let mut model = Model {
             root: root.to_path_buf(),
             nodes,
             choice: vec![None; count],
             include: vec![false; count],
             name: manifest.package.name.clone(),
-            kind: manifest.package.kind(),
+            kind,
             std: manifest.package.cxx_standard.get(),
             defines: manifest.build.defines.join(", "),
             libs: manifest.build.libs.join(", "),
@@ -696,7 +692,7 @@ impl Model {
     }
 
     pub fn toggle_source(&mut self, index: usize) {
-        if self.nodes[index].locked {
+        if self.nodes[index].locked || self.nodes[index].src_total == 0 {
             return;
         }
         let computed = self.compute();
@@ -808,7 +804,7 @@ impl Model {
         format!(
             "[package]\nname = {:?}\nversion = \"0.1.0\"\ntype = \"{}\"\ncxx_standard = {:?}\n",
             self.name,
-            kind_name(self.kind),
+            self.kind.name(),
             self.std
         )
     }
@@ -879,7 +875,7 @@ impl Model {
                 extras += ", default-features = false";
             }
             if let Some(link) = dep.link {
-                extras += &format!(", link = {:?}", kind_name(link));
+                extras += &format!(", link = {:?}", link.name());
             }
             let spec = match &dep.version {
                 Some(version) => format!("version = {version:?}"),

@@ -1,0 +1,8 @@
+[package]
+name = "emscripten"
+version = "0.1.0"
+type = "executable"
+cxx_standard = 20
+
+[target.emscripten.build]
+link_flags = ["--embed-file", "assets"]

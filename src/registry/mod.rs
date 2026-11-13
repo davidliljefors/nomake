@@ -71,6 +71,8 @@ pub struct Resolver {
     lock: Lock,
     src: PathBuf,
     jobs: Vec<fetch::Job>,
+    /// Locate without queueing sources: for locking the dependencies of targets that are not being built.
+    lock_only: bool,
 }
 
 impl Resolver {
@@ -87,7 +89,12 @@ impl Resolver {
             lock,
             src: cache_dir()?.join("src"),
             jobs: Vec::new(),
+            lock_only: false,
         })
+    }
+
+    pub fn lock_only(&mut self) {
+        self.lock_only = true;
     }
 
     /// Picks the version (the locked one when it satisfies `requirement`) and queues its sources for fetching.
@@ -114,7 +121,9 @@ impl Resolver {
         });
         let job = fetch::Job::new(&self.src, name, &recipe.version, source);
         let root = job.dest.clone();
-        self.jobs.push(job);
+        if !self.lock_only {
+            self.jobs.push(job);
+        }
         Ok(Located {
             root,
             recipe: recipe.path,
@@ -138,6 +147,7 @@ pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Os;
     use std::fs;
 
     /// A repository with one commit; returns its path and full commit hash.
@@ -236,6 +246,54 @@ mod tests {
         run(&["update"]).unwrap();
         run(&["cache", "clean"]).unwrap();
         assert!(!root.join("home").join("src").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn switching_targets_keeps_every_targets_lock_entries() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = env::temp_dir().join(format!("nomake_lock_targets_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (repo, rev) = repo_with_commit(&root);
+        let registry = root.join("registry");
+        let publish = |name: &str, version: &str| {
+            let dir = registry.join(name).join(version);
+            fs::create_dir_all(&dir).unwrap();
+            let git = repo.display().to_string().replace('\\', "/");
+            fs::write(
+                dir.join("nomake.toml"),
+                format!(
+                    "[package]\nname = \"{name}\"\n[source]\ngit = \"{git}\"\nrev = \"{rev}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        env::set_var("NOMAKE_HOME", root.join("home"));
+        env::set_var("NOMAKE_REGISTRY", &registry);
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("nomake.toml"),
+            "[package]\nname = \"app\"\n[dependencies]\nbase = { version = \"1\" }\n\
+             [target.emscripten.dependencies]\nweb = { version = \"5.4\" }\n",
+        )
+        .unwrap();
+        publish("base", "1.0.0");
+        publish("web", "5.4.7");
+        let lock = || fs::read_to_string(project.join("nomake.lock")).unwrap();
+
+        crate::scanner::load(&project, Os::Linux).unwrap();
+        assert!(lock().contains("base") && lock().contains("5.4.7"));
+
+        publish("web", "5.4.8");
+        crate::scanner::load(&project, Os::Emscripten).unwrap();
+        crate::scanner::load(&project, Os::Linux).unwrap();
+        assert!(lock().contains("5.4.7") && !lock().contains("5.4.8"));
+
+        crate::scanner::update(&project, &[]).unwrap();
+        assert!(lock().contains("5.4.8") && lock().contains("base"));
         fs::remove_dir_all(root).unwrap();
     }
 }

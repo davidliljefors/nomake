@@ -59,9 +59,9 @@ fn plan(
 ) -> Result<(scanner::Workspace, Toolchain, Graph)> {
     let root_dir = absolute(Path::new("."));
     let ws = if roots.is_empty() {
-        scanner::load(&root_dir)?
+        scanner::load(&root_dir, arch.os())?
     } else {
-        scanner::load_roots(&root_dir, roots)?
+        scanner::load_roots(&root_dir, roots, arch.os())?
     };
     let tc = Toolchain::detect(&ws.root().toolchain, arch, &root_dir.join("build"))?;
     let graph = dag::build(
@@ -134,7 +134,6 @@ pub fn build(opts: &BuildOpts) -> Result<Built> {
     let kind = root.kind;
     let target = graph.target.clone();
     let targets = graph.targets.clone();
-    // Freeing 10k nodes is pure latency; let it overlap the exit or the program `run` starts.
     std::thread::spawn(move || drop((graph, ws)));
     Ok(Built {
         ok: summary.ok,
@@ -144,10 +143,9 @@ pub fn build(opts: &BuildOpts) -> Result<Built> {
     })
 }
 
-/// Builds and runs the test package in the current directory.
 pub fn test(opts: BuildOpts, extra: &[String]) -> Result<i32> {
     let dir = absolute(Path::new("."));
-    let manifest = Manifest::load_resolved(&dir.join("nomake.toml"))?;
+    let manifest = Manifest::load_resolved(&dir.join("nomake.toml"), opts.arch.os())?;
     if !manifest.package.is_test() {
         bail!(
             "package '{}' is not a test (set type = \"test\")",
@@ -162,7 +160,23 @@ pub fn test(opts: BuildOpts, extra: &[String]) -> Result<i32> {
     testrun::run(opts, &[test], extra)
 }
 
-/// Builds and runs the executable, from `cwd` when given (the package's folder, in a workspace).
+pub fn launcher(target: &Path) -> Result<Command> {
+    if target.extension().is_some_and(|ext| ext == "html") {
+        let js = target.with_extension("js");
+        if !js.is_file() {
+            bail!(
+                "{} has no companion {} (single-file HTML builds must be served over HTTP)",
+                target.display(),
+                js.display()
+            );
+        }
+        let mut command = Command::new("node");
+        command.arg(js);
+        return Ok(command);
+    }
+    Ok(Command::new(target))
+}
+
 pub fn run(opts: &BuildOpts, args: &[String], cwd: Option<&Path>) -> Result<i32> {
     let built = build(opts)?;
     if !built.ok {
@@ -171,7 +185,7 @@ pub fn run(opts: &BuildOpts, args: &[String], cwd: Option<&Path>) -> Result<i32>
     if built.kind != Kind::Executable {
         bail!("package is not an executable");
     }
-    let mut command = Command::new(&built.target);
+    let mut command = launcher(&built.target)?;
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -226,12 +240,7 @@ pub fn new(name: &str, kind: Kind) -> Result<()> {
         bail!("{name} already exists");
     }
     fs::create_dir_all(dir.join("src"))?;
-    let kind_str = match kind {
-        Kind::Executable => "executable",
-        Kind::Test => "test",
-        Kind::Static => "static",
-        Kind::Shared => "shared",
-    };
+    let kind_str = kind.name();
     fs::write(
         dir.join("nomake.toml"),
         format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\ntype = \"{kind_str}\"\ncxx_standard = \"20\"\n"),
@@ -255,4 +264,29 @@ pub fn new(name: &str, kind: Kind) -> Result<()> {
     fs::write(dir.join(".gitignore"), "/build\n/compile_commands.json\n")?;
     println!("nomake: created {name}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launcher_runs_native_directly_and_wasm_companion_js_under_node() {
+        let native = launcher(Path::new("app.exe")).unwrap();
+        assert_eq!(native.get_program(), "app.exe");
+        let dir = std::env::temp_dir().join(format!("nomake_launch_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let html = dir.join("app.html");
+        assert!(launcher(&html)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("single-file HTML"));
+        let js = dir.join("app.js");
+        fs::write(&js, "").unwrap();
+        let wasm = launcher(&html).unwrap();
+        assert_eq!(wasm.get_program(), "node");
+        assert_eq!(wasm.get_args().collect::<Vec<_>>(), [js.as_os_str()]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

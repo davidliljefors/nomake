@@ -4,11 +4,11 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{Arch, Toolchain};
 use crate::commands::out_dir;
 use crate::config::Kind;
 use crate::dag::compile_scope;
 use crate::scanner::{self, is_header, Pkg, Workspace};
+use crate::toolchain::{Arch, Toolchain};
 use crate::util::{absolute, hash, hash_seeded};
 use crate::Result;
 
@@ -83,9 +83,12 @@ pub fn generate(archs: &[Arch]) -> Result<()> {
 
 /// One solution in `root_dir` holding the packages in `member_dirs`, all building into its build/.
 pub fn generate_for(root_dir: &Path, member_dirs: &[PathBuf], archs: &[Arch]) -> Result<()> {
+    if archs.contains(&Arch::Wasm32) {
+        bail!("`nomake vs` cannot target wasm32; use `nomake compdb -a wasm32` for editor support");
+    }
     let vs_dir = root_dir.join("build").join("vs");
     fs::create_dir_all(&vs_dir)?;
-    let ws = scanner::load_roots(root_dir, member_dirs)?;
+    let ws = scanner::load_roots(root_dir, member_dirs, crate::config::Os::host())?;
     let tc = Toolchain::detect(&ws.root().toolchain, Arch::host(), &root_dir.join("build"))?;
     let workspace = !(member_dirs.len() == 1 && member_dirs[0] == root_dir);
     let ctx = Context {
@@ -314,7 +317,12 @@ fn config_properties(ctx: &Context, index: usize, config: &Config) -> String {
     let build = format!("cd /d \"{root}\" && \"{nomake}\" build{member} --arch {arch}{flag}");
     let clean = format!("cd /d \"{root}\" && \"{nomake}\" clean --arch {arch}{flag}");
     let rebuild = format!("{clean} && \"{nomake}\" build{member} --arch {arch}{flag}");
-    let output = out.join(ctx.tc.artifact(pkg.kind, &pkg.name).0);
+    let output = out.join(
+        ctx.tc
+            .artifact(pkg.kind, &pkg.name)
+            .expect("artifact name")
+            .0,
+    );
 
     let mut text = String::new();
     text.push_str(&property("NMakeBuildCommandLine", &build));

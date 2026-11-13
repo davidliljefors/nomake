@@ -15,6 +15,17 @@ pub enum Kind {
     Test,
 }
 
+impl Kind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Executable => "executable",
+            Kind::Static => "static",
+            Kind::Shared => "shared",
+            Kind::Test => "test",
+        }
+    }
+}
+
 /// `cxx_standard = "20"` and `cxx_standard = 20` are both accepted.
 #[derive(Deserialize, Clone)]
 #[serde(untagged)]
@@ -50,7 +61,7 @@ pub struct Manifest {
     pub dependencies: BTreeMap<String, Dependency>,
     #[serde(default)]
     pub generate: Vec<Generate>,
-    /// Per-OS additions, applied by `resolve`; keyed by `windows`, `macos`, `linux` or `unix`.
+    /// Per-OS additions, applied by `resolve`; keyed by `windows`, `macos`, `linux`, `unix` or `emscripten`.
     #[serde(default)]
     pub target: BTreeMap<String, Target>,
     /// How `nomake test` runs a package of type `test`.
@@ -124,6 +135,9 @@ pub struct Target {
     /// Features that only exist on this OS; they add to a base feature of the same name.
     #[serde(default)]
     pub feature: BTreeMap<String, Feature>,
+    /// Generate steps that only run on this OS, after the base ones.
+    #[serde(default)]
+    pub generate: Vec<Generate>,
 }
 
 /// A dependency entry inside a target table; it merges into the base entry of the same name.
@@ -137,8 +151,43 @@ pub struct TargetDependency {
     pub features: Vec<String>,
 }
 
-const TARGET_NAMES: [&str; 4] = ["windows", "macos", "linux", "unix"];
+const TARGET_NAMES: [&str; 5] = ["windows", "macos", "linux", "unix", "emscripten"];
 
+/// The operating system (or runtime) the build targets; it picks the `[target.<os>]` tables.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(clippy::enum_variant_names)]
+pub enum Os {
+    Windows,
+    MacOs,
+    Linux,
+    /// Any other Unix (FreeBSD and friends): only the `unix` tables apply.
+    Unix,
+    Emscripten,
+}
+
+impl Os {
+    pub fn host() -> Os {
+        if cfg!(windows) {
+            Os::Windows
+        } else if cfg!(target_os = "macos") {
+            Os::MacOs
+        } else if cfg!(target_os = "linux") {
+            Os::Linux
+        } else {
+            Os::Unix
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Os::Windows => "windows",
+            Os::MacOs => "macos",
+            Os::Linux => "linux",
+            Os::Unix => "unix",
+            Os::Emscripten => "emscripten",
+        }
+    }
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Package {
@@ -395,11 +444,11 @@ impl Manifest {
         Ok(manifest)
     }
 
-    /// Loads the manifest as it applies to the host OS, with its target tables merged in.
-    pub fn load_resolved(path: &Path) -> Result<Manifest> {
+    /// Loads the manifest as it applies to `os`, with its target tables merged in.
+    pub fn load_resolved(path: &Path, os: Os) -> Result<Manifest> {
         let mut manifest = Manifest::load(path)?;
         manifest
-            .resolve(std::env::consts::OS)
+            .resolve(os.name())
             .map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(manifest)
     }
@@ -412,7 +461,7 @@ impl Manifest {
             .find(|name| !TARGET_NAMES.contains(&name.as_str()))
         {
             return Err(format!(
-                "unknown target '{name}' (expected windows, macos, linux or unix)"
+                "unknown target '{name}' (expected windows, macos, linux, emscripten or unix)"
             )
             .into());
         }
@@ -447,7 +496,9 @@ impl Manifest {
         if os != "windows" {
             order.push("unix");
         }
-        order.push(os);
+        if os != "unix" {
+            order.push(os);
+        }
         for name in order {
             if let Some(target) = targets.get(name) {
                 self.merge(name, target)?;
@@ -484,6 +535,7 @@ impl Manifest {
         add_sources(&mut self.sources, &target.sources);
         add_include(&mut self.include, &target.include);
         add_build(&mut self.build, &target.build);
+        self.generate.extend(target.generate.iter().cloned());
         for (feature_name, extra) in &target.feature {
             let feature = self.feature.entry(feature_name.clone()).or_default();
             add_sources(&mut feature.sources, &extra.sources);
@@ -532,7 +584,8 @@ impl Manifest {
         if let Some(source) = &self.source {
             source.check()?;
         }
-        for step in &self.generate {
+        let target_steps = self.target.values().flat_map(|target| &target.generate);
+        for step in self.generate.iter().chain(target_steps) {
             step.check()?;
         }
         for (key, dep) in &self.dependencies {
@@ -733,6 +786,32 @@ w = { path = "deps/w" }
         );
         assert_eq!(resolved("windows").build.defines, ["WIN"]);
         assert!(resolved("linux").build.defines.is_empty());
+    }
+
+    #[test]
+    fn unix_hosts_other_than_linux_and_macos_get_only_the_unix_table() {
+        assert_eq!(resolved("unix").sources.files, ["common.c", "unix.c"]);
+        assert_eq!(Os::Unix.name(), "unix");
+    }
+
+    #[test]
+    fn target_generate_steps_run_only_on_their_os() {
+        let text = "[package]\nname = \"x\"\n[[generate]]\nname = \"base\"\ncommand = [\"a\"]\noutputs = [\"b\"]\n\
+            [[target.emscripten.generate]]\nname = \"wasm\"\ncommand = [\"c\"]\noutputs = [\"d\"]";
+        let names = |os: &str| {
+            let mut manifest: Manifest = toml::from_str(text).unwrap();
+            manifest.check().unwrap();
+            manifest.resolve(os).unwrap();
+            manifest
+                .generate
+                .iter()
+                .map(|step| step.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("emscripten"), ["base", "wasm"]);
+        assert_eq!(names("linux"), ["base"]);
+        let bad = "[package]\nname = \"x\"\n[[target.emscripten.generate]]\ncommand = [\"c\"]\noutputs = [\"d\"]";
+        assert!(toml::from_str::<Manifest>(bad).unwrap().check().is_err());
     }
 
     #[test]

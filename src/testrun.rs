@@ -1,8 +1,8 @@
 //! `nomake test`: builds the packages of type `test` and runs each one. A test passes when it exits with 0.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -38,8 +38,8 @@ fn drain<R: Read + Send + 'static>(mut from: R, sink: Sink) -> JoinHandle<()> {
 }
 
 /// Runs `exe` in the test's folder with stdout and stderr captured, and kills it after the timeout.
-fn run_one(exe: &PathBuf, test: &Test, extra: &[String]) -> Result<(Outcome, String)> {
-    let mut command = Command::new(exe);
+fn run_one(exe: &Path, test: &Test, extra: &[String]) -> Result<(Outcome, String)> {
+    let mut command = commands::launcher(exe)?;
     command
         .args(&test.config.args)
         .args(extra)

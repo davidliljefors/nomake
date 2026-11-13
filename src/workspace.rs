@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::commands::{self, BuildOpts};
-use crate::config::{Kind, Manifest, TestConfig, WorkspaceDef};
+use crate::config::{Kind, Manifest, Os, TestConfig, WorkspaceDef};
 use crate::testrun::{self, Test};
-use crate::toolchain::{vs, Arch};
-use crate::Result;
+use crate::toolchain::Arch;
+use crate::{vs, Result};
 
 /// Lenient on purpose: ordinary manifests also pass through here, and only `[workspace]` matters.
 #[derive(Deserialize)]
@@ -34,7 +34,7 @@ pub struct Root {
 }
 
 /// The workspace rooted at `dir`, if its nomake.toml has a `[workspace]` table.
-pub fn find(dir: &Path) -> Result<Option<Root>> {
+pub fn find(dir: &Path, os: Os) -> Result<Option<Root>> {
     let Ok(text) = fs::read_to_string(dir.join("nomake.toml")) else {
         return Ok(None);
     };
@@ -57,7 +57,7 @@ pub fn find(dir: &Path) -> Result<Option<Root>> {
     }
     let mut members: Vec<Member> = Vec::new();
     for member in dirs {
-        let manifest = Manifest::load_resolved(&member.join("nomake.toml"))?;
+        let manifest = Manifest::load_resolved(&member.join("nomake.toml"), os)?;
         let name = manifest.package.name.clone();
         if members.iter().any(|other| other.name == name) {
             bail!("workspace has two packages named '{name}'");
