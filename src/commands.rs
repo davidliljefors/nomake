@@ -1,11 +1,11 @@
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::compdb;
-use crate::config::{Kind, Manifest};
-use crate::dag::{self, Graph};
+use crate::config::{self, Kind, Manifest};
+use crate::dag::{self, Graph, Target};
 use crate::executor;
 use crate::scanner;
 use crate::state::State;
@@ -28,8 +28,7 @@ pub struct BuildOpts {
 
 pub struct Built {
     pub ok: bool,
-    pub target: PathBuf,
-    pub targets: Vec<(PathBuf, PathBuf)>,
+    pub targets: Vec<Target>,
     pub kind: Kind,
 }
 
@@ -63,10 +62,24 @@ fn plan(
     } else {
         scanner::load_roots(&root_dir, roots, arch.os())?
     };
-    let tc = Toolchain::detect(&ws.root().toolchain, arch, &root_dir.join("build"))?;
-    let graph = dag::build(
+    let build_root = root_dir.join("build");
+    let tc = Toolchain::detect(&ws.root().toolchain, arch, &build_root)?;
+    let host = if arch != Arch::host() {
+        let tools = dag::tool_roots(&ws);
+        if tools.is_empty() {
+            None
+        } else {
+            let host_ws = scanner::load_host_tools(&root_dir, &tools)?;
+            let host_tc = Toolchain::detect_host(&config::Toolchain::default(), &build_root)?;
+            Some((host_ws, host_tc))
+        }
+    } else {
+        None
+    };
+    let graph = dag::build_with_host(
         &ws,
         &tc,
+        host.as_ref().map(|(ws, tc)| (ws, tc)),
         release,
         &root_dir,
         &out_dir(&root_dir, arch, release),
@@ -132,12 +145,10 @@ pub fn build(opts: &BuildOpts) -> Result<Built> {
         );
     }
     let kind = root.kind;
-    let target = graph.target.clone();
     let targets = graph.targets.clone();
     std::thread::spawn(move || drop((graph, ws)));
     Ok(Built {
         ok: summary.ok,
-        target,
         targets,
         kind,
     })
@@ -160,32 +171,18 @@ pub fn test(opts: BuildOpts, extra: &[String]) -> Result<i32> {
     testrun::run(opts, &[test], extra)
 }
 
-pub fn launcher(target: &Path) -> Result<Command> {
-    if target.extension().is_some_and(|ext| ext == "html") {
-        let js = target.with_extension("js");
-        if !js.is_file() {
-            bail!(
-                "{} has no companion {} (single-file HTML builds must be served over HTTP)",
-                target.display(),
-                js.display()
-            );
-        }
-        let mut command = Command::new("node");
-        command.arg(js);
-        return Ok(command);
-    }
-    Ok(Command::new(target))
-}
-
 pub fn run(opts: &BuildOpts, args: &[String], cwd: Option<&Path>) -> Result<i32> {
     let built = build(opts)?;
     if !built.ok {
         return Ok(1);
     }
-    if built.kind != Kind::Executable {
+    if !built.kind.is_program() {
         bail!("package is not an executable");
     }
-    let mut command = launcher(&built.target)?;
+    let Some(launch) = &built.targets[0].launch else {
+        bail!("package is not an executable");
+    };
+    let mut command = launch.command()?;
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -241,11 +238,20 @@ pub fn new(name: &str, kind: Kind) -> Result<()> {
     }
     fs::create_dir_all(dir.join("src"))?;
     let kind_str = kind.name();
+    let public_inc = if kind.is_program() {
+        "[]"
+    } else {
+        "[\"include\"]"
+    };
     fs::write(
         dir.join("nomake.toml"),
-        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\ntype = \"{kind_str}\"\ncxx_standard = \"20\"\n"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\ntype = \"{kind_str}\"\ncxx_standard = \"20\"\n\n\
+             [sources]\ndirs = [\"src\"]\n\n\
+             [include]\npublic = {public_inc}\nprivate = [\"src\"]\n"
+        ),
     )?;
-    if kind == Kind::Executable {
+    if kind.is_program() {
         fs::write(
             dir.join("src/main.cpp"),
             "#include <cstdio>\n\nint main() {\n    std::puts(\"hello from nomake\");\n}\n",
@@ -269,24 +275,48 @@ pub fn new(name: &str, kind: Kind) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::toolchain::{Family, Launch};
 
     #[test]
-    fn launcher_runs_native_directly_and_wasm_companion_js_under_node() {
-        let native = launcher(Path::new("app.exe")).unwrap();
+    fn launch_spec_runs_native_directly_and_wasm_companion_js_under_node() {
+        let native_tc = Toolchain::for_tests(Family::Clang);
+        let native = native_tc
+            .launch(Kind::Executable, Path::new("app.exe"), &[])
+            .unwrap()
+            .command()
+            .unwrap();
         assert_eq!(native.get_program(), "app.exe");
-        let dir = std::env::temp_dir().join(format!("nomake_launch_{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let html = dir.join("app.html");
-        assert!(launcher(&html)
+
+        let wasm_tc = Toolchain::for_tests(Family::Emscripten);
+        let html = Path::new("build/app.html");
+        let regular = wasm_tc
+            .launch(Kind::Executable, html, &[])
+            .unwrap()
+            .command()
+            .unwrap();
+        assert_eq!(regular.get_program(), "node");
+        assert_eq!(
+            regular.get_args().collect::<Vec<_>>(),
+            [Path::new("build/app.js").as_os_str()]
+        );
+
+        let single = wasm_tc
+            .launch(Kind::Executable, html, &["-sSINGLE_FILE=1".into()])
+            .unwrap();
+        assert!(single
+            .command()
             .err()
             .unwrap()
             .to_string()
             .contains("single-file HTML"));
-        let js = dir.join("app.js");
-        fs::write(&js, "").unwrap();
-        let wasm = launcher(&html).unwrap();
-        assert_eq!(wasm.get_program(), "node");
-        assert_eq!(wasm.get_args().collect::<Vec<_>>(), [js.as_os_str()]);
-        fs::remove_dir_all(&dir).unwrap();
+
+        let test_js = wasm_tc
+            .launch(
+                Kind::Test,
+                Path::new("build/suite.js"),
+                &["-sSINGLE_FILE=1".into()],
+            )
+            .unwrap();
+        assert_eq!(test_js, Launch::Node(PathBuf::from("build/suite.js")));
     }
 }

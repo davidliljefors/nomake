@@ -98,16 +98,19 @@ const FAKE_EM_BAT: &str = "@echo off\r\n\
 echo %*>>\"%~dp0log.txt\"\r\n\
 if \"%~1\"==\"--version\" goto version\r\n\
 set \"out=\"\r\n\
+set \"single=\"\r\n\
 :loop\r\n\
 if \"%~1\"==\"\" goto done\r\n\
 if \"%~1\"==\"-o\" set \"out=%~2\"\r\n\
+if /i \"%~1\"==\"-sSINGLE_FILE=1\" set \"single=1\"\r\n\
 shift\r\n\
 goto loop\r\n\
 :done\r\n\
 if \"%out%\"==\"\" exit /b 0\r\n\
 echo fake>\"%out%\"\r\n\
 if /i \"%out:~-3%\"==\".js\" echo fake>\"%out:~0,-3%.wasm\"\r\n\
-if /i \"%out:~-5%\"==\".html\" echo fake>\"%out:~0,-5%.js\"\r\n\
+if /i \"%out:~-3%\"==\".js\" echo process.exit(0^);>\"%out%\"\r\n\
+if /i \"%out:~-5%\"==\".html\" if not defined single echo process.exit(0^);>\"%out:~0,-5%.js\"\r\n\
 if /i \"%out:~-5%\"==\".html\" echo fake>\"%out:~0,-5%.wasm\"\r\n\
 exit /b 0\r\n\
 :version\r\n\
@@ -122,10 +125,15 @@ const FAKE_EM_SH: &str = "#!/bin/sh\n\
 echo \"$@\" >> \"$(dirname \"$0\")/log.txt\"\n\
 if [ \"$1\" = --version ]; then echo 'emcc (Emscripten) 3.1.0'; exit 0; fi\n\
 out=\n\
-while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n\
+single=0\n\
+while [ $# -gt 0 ]; do\n\
+  [ \"$1\" = -o ] && out=$2\n\
+  [ \"$1\" = -sSINGLE_FILE=1 ] && single=1\n\
+  shift\n\
+done\n\
 [ -n \"$out\" ] || exit 0\n\
 echo fake > \"$out\"\n\
-case \"$out\" in *.js) echo fake > \"${out%.js}.wasm\";; *.html) echo fake > \"${out%.html}.js\"; echo fake > \"${out%.html}.wasm\";; esac\n";
+case \"$out\" in *.js) echo fake > \"${out%.js}.wasm\"; echo 'process.exit(0);' > \"$out\";; *.html) [ \"$single\" = 1 ] || echo 'process.exit(0);' > \"${out%.html}.js\"; echo fake > \"${out%.html}.wasm\";; esac\n";
 
 const FAKE_EMAR_SH: &str = "#!/bin/sh\n\
 echo emar \"$@\" >> \"$(dirname \"$0\")/log.txt\"\n\
@@ -141,9 +149,9 @@ fn wasm_project(sandbox: &Sandbox, dir: &str, link_flags: &str) {
         ),
     );
     sandbox.write(&format!("{dir}/src/main.cpp"), "int main() {}\n");
-    sandbox.write(&format!("{dir}/assets/a.txt"), "a");
+    sandbox.write(&format!("{dir}/assets/nested/a.txt"), "a");
     sandbox.write(&format!("{dir}/shell.html"), "<html></html>");
-    sandbox.age(&format!("{dir}/assets/a.txt"), 100);
+    sandbox.age(&format!("{dir}/assets/nested/a.txt"), 100);
     sandbox.age(&format!("{dir}/shell.html"), 100);
 }
 
@@ -187,7 +195,11 @@ fn wasm_builds_through_a_shim_in_a_path_with_spaces_and_ignores_a_native_cxx() {
     assert!(sandbox.exists("app/build/wasm32-debug/app.js"));
     assert!(sandbox.exists("app/build/wasm32-debug/app.wasm"));
     assert!(sandbox.log().contains("-c"), "the shim compiled");
-
+    assert!(
+        sandbox.log().contains("--shell-file")
+            && sandbox.exists("app/build/wasm32-debug/shell.html"),
+        "executables get nomake's full-page shell by default"
+    );
     let clean = sandbox.nomake("app", &["clean", "-a", "wasm32"], None);
     assert!(clean.status.success(), "{}", text(&clean));
     assert!(!sandbox.exists("app/build/wasm32-debug"));
@@ -207,10 +219,14 @@ fn wasm_relinks_when_a_file_named_by_a_link_flag_changes() {
     };
     build(&sandbox);
     assert_eq!(sandbox.links("app.html"), 1);
+    assert!(
+        !sandbox.exists("app/build/wasm32-debug/shell.html"),
+        "a user --shell-file replaces the default"
+    );
     build(&sandbox);
     assert_eq!(sandbox.links("app.html"), 1, "nothing changed");
 
-    sandbox.write("app/assets/a.txt", "changed");
+    sandbox.write("app/assets/nested/a.txt", "changed");
     build(&sandbox);
     assert_eq!(sandbox.links("app.html"), 2, "an embedded file changed");
 
@@ -219,6 +235,21 @@ fn wasm_relinks_when_a_file_named_by_a_link_flag_changes() {
     assert_eq!(sandbox.links("app.html"), 3, "the shell changed");
     build(&sandbox);
     assert_eq!(sandbox.links("app.html"), 3);
+
+    fs::remove_file(sandbox.root.join("app/assets/nested/a.txt")).unwrap();
+    build(&sandbox);
+    assert_eq!(
+        sandbox.links("app.html"),
+        4,
+        "a nested embedded file was removed"
+    );
+    sandbox.write("app/assets/nested/new.txt", "new");
+    build(&sandbox);
+    assert_eq!(
+        sandbox.links("app.html"),
+        5,
+        "a nested embedded file was added"
+    );
 }
 
 #[test]
@@ -233,12 +264,55 @@ fn single_file_builds_do_not_relink_for_missing_side_files() {
 }
 
 #[test]
-fn workspace_link_flag_paths_are_relative_to_where_nomake_runs() {
+fn switching_to_single_file_does_not_run_a_stale_js_companion() {
+    let sandbox = Sandbox::new("single stale js");
+    wasm_project(&sandbox, "app", "[]");
+
+    let regular = sandbox.nomake("app", &["run", "-a", "wasm32"], None);
+    assert!(regular.status.success(), "{}", text(&regular));
+    assert!(sandbox.exists("app/build/wasm32-debug/app.js"));
+    assert_eq!(
+        fs::read_to_string(sandbox.root.join("app/build/wasm32-debug/app.js")).unwrap(),
+        "process.exit(0);\r\n"
+    );
+
+    sandbox.write(
+        "app/nomake.toml",
+        "[package]\nname = \"app\"\ntype = \"executable\"\n\
+         [target.emscripten.build]\nlink_flags = [\"-sSINGLE_FILE=1\"]\n",
+    );
+    let single = sandbox.nomake("app", &["run", "-a", "wasm32"], None);
+    assert!(!single.status.success());
+    assert!(
+        text(&single).contains("single-file HTML"),
+        "{}",
+        text(&single)
+    );
+    assert!(sandbox.exists("app/build/wasm32-debug/app.js"));
+}
+
+#[test]
+fn package_relative_link_flags_work_across_workspaces_and_dependencies() {
     let sandbox = Sandbox::new("workspace");
     wasm_project(&sandbox, "ws/app", r#"["--embed-file", "assets"]"#);
+    sandbox.write(
+        "ws/app/nomake.toml",
+        "[package]\nname = \"app\"\ntype = \"executable\"\n\
+         [dependencies]\njsdep = { path = \"../jsdep\" }\n\
+         [target.emscripten.build]\nlink_flags = [\"--embed-file\", \"assets\"]\n",
+    );
+    sandbox.write(
+        "ws/jsdep/nomake.toml",
+        "[package]\nname = \"jsdep\"\ntype = \"static\"\n\
+         [target.emscripten.build]\nlink_flags = [\"--js-library\", \"js/bridge.js\"]\n",
+    );
+    sandbox.write("ws/jsdep/src/lib.cpp", "int bridge() { return 1; }\n");
+    sandbox.write(
+        "ws/jsdep/js/bridge.js",
+        "mergeInto(LibraryManager.library, {});",
+    );
+    sandbox.age("ws/jsdep/js/bridge.js", 100);
     sandbox.write("ws/nomake.toml", "[workspace]\nmembers = [\"app\"]\n");
-    sandbox.write("ws/assets/a.txt", "a");
-    sandbox.age("ws/assets/a.txt", 100);
     let build = |sandbox: &Sandbox| {
         let output = sandbox.nomake("ws", &["build", "-a", "wasm32"], None);
         assert!(output.status.success(), "{}", text(&output));
@@ -246,9 +320,95 @@ fn workspace_link_flag_paths_are_relative_to_where_nomake_runs() {
     build(&sandbox);
     build(&sandbox);
     assert_eq!(sandbox.links("app.html"), 1);
-    sandbox.write("ws/assets/a.txt", "changed");
+    assert!(sandbox.log().contains("app/assets@assets"));
+    assert!(sandbox.log().contains("jsdep/js/bridge.js"));
+
+    sandbox.write("ws/app/assets/nested/a.txt", "changed");
     build(&sandbox);
     assert_eq!(sandbox.links("app.html"), 2);
+
+    sandbox.write(
+        "ws/jsdep/js/bridge.js",
+        "mergeInto(LibraryManager.library, { x: 1 });",
+    );
+    build(&sandbox);
+    assert_eq!(sandbox.links("app.html"), 3);
+}
+
+#[test]
+fn wasm_falls_back_to_static_for_dual_mode_libs_and_runs_host_generators_and_js_tests() {
+    let sandbox = Sandbox::new("zero config wasm");
+    sandbox.fake_emsdk();
+
+    // Dual-mode library: shared-first for fast native iteration, automatic static on wasm32.
+    sandbox.write(
+        "dual/nomake.toml",
+        "[package]\nname = \"dual\"\ntype = [\"shared\", \"static\"]\n[build]\nshared_defines = [\"DUAL_DLL\"]\n",
+    );
+    sandbox.write("dual/src/dual.cpp", "int dual() { return 7; }\n");
+
+    // Host C++ generator tool: built with the host compiler and run to produce generated C++ for wasm.
+    sandbox.write(
+        "gen/nomake.toml",
+        "[package]\nname = \"gen\"\ntype = \"executable\"\n",
+    );
+    sandbox.write(
+        "gen/src/main.cpp",
+        "#include <cstdio>\n#include <cstring>\n\
+         int main(int argc, char** argv) {\n\
+             const char* out_dir = nullptr;\n\
+             const char* depfile = nullptr;\n\
+             for (int i = 1; i + 1 < argc; ++i) {\n\
+                 if (std::strcmp(argv[i], \"--out-dir\") == 0) out_dir = argv[++i];\n\
+                 else if (std::strcmp(argv[i], \"--depfile\") == 0) depfile = argv[++i];\n\
+             }\n\
+             char hdr[512];\n\
+             std::snprintf(hdr, sizeof hdr, \"%s/val.gen.hpp\", out_dir);\n\
+             FILE* f = std::fopen(hdr, \"w\");\n\
+             std::fputs(\"inline int gen_val() { return 42; }\\n\", f);\n\
+             std::fclose(f);\n\
+             FILE* d = std::fopen(depfile, \"w\");\n\
+             std::fprintf(d, \"%s: %s\\n\", hdr, argv[argc - 1]);\n\
+             std::fclose(d);\n\
+             return 0;\n\
+         }\n",
+    );
+
+    // App with an Emscripten overlay on top of default `src/`, dual-mode dep, and host generator.
+    sandbox.write(
+        "app/nomake.toml",
+        "[package]\nname = \"app\"\ntype = \"executable\"\n\
+         [dependencies]\ndual = { path = \"../dual\" }\ngen = { path = \"../gen\" }\n\
+         [[generate]]\ntool = \"gen\"\ninputs = [\"schema/val.in\"]\noutputs = [\"{stem}.gen.hpp\"]\n\
+         [target.emscripten]\nsources.files = [\"web/extra.cpp\"]\n",
+    );
+    sandbox.write("app/schema/val.in", "42\n");
+    sandbox.write(
+        "app/src/main.cpp",
+        "#include \"val.gen.hpp\"\nint main() { return gen_val() == 42 ? 0 : 1; }\n",
+    );
+    sandbox.write("app/web/extra.cpp", "int web_only() { return 1; }\n");
+
+    let native = sandbox.nomake("app", &["build"], None);
+    if !text(&native).contains("no C++ compiler found") {
+        assert!(native.status.success(), "{}", text(&native));
+        let wasm = sandbox.nomake("app", &["build", "-a", "wasm32"], None);
+        assert!(wasm.status.success(), "{}", text(&wasm));
+        assert!(sandbox.exists("app/build/wasm32-debug/libdual.a"));
+        assert!(sandbox.exists("app/build/wasm32-debug/gen/app/val.gen.hpp"));
+        assert!(!sandbox.log().contains("-DDUAL_DLL"));
+    }
+
+    // `type = "test"` builds `<name>.js` directly without an HTML shell and runs under node.
+    sandbox.write(
+        "suite/nomake.toml",
+        "[package]\nname = \"suite\"\ntype = \"test\"\n",
+    );
+    sandbox.write("suite/src/test.cpp", "int main() { return 0; }\n");
+    let test = sandbox.nomake("suite", &["test", "-a", "wasm32"], None);
+    assert!(test.status.success(), "{}", text(&test));
+    assert!(sandbox.exists("suite/build/wasm32-debug/suite.js"));
+    assert!(!sandbox.exists("suite/build/wasm32-debug/suite.html"));
 }
 
 #[test]

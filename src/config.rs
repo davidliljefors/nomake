@@ -24,6 +24,10 @@ impl Kind {
             Kind::Test => "test",
         }
     }
+
+    pub fn is_program(self) -> bool {
+        matches!(self, Kind::Executable | Kind::Test)
+    }
 }
 
 /// `cxx_standard = "20"` and `cxx_standard = 20` are both accepted.
@@ -78,6 +82,9 @@ pub struct Manifest {
     /// Dependency keys of the root project named by enabled features; filled in by `enable`.
     #[serde(skip)]
     pub peers: BTreeSet<String>,
+    /// True when the base manifest omitted `[include]`, so `include/` and `src/` still apply alongside overlays.
+    #[serde(skip)]
+    pub include_defaults: bool,
 }
 
 /// `[workspace]`: package folders built together. An entry ending in `/*` takes every subfolder with a nomake.toml.
@@ -149,6 +156,9 @@ pub struct TargetDependency {
     pub public: Option<bool>,
     #[serde(default)]
     pub features: Vec<String>,
+    #[serde(rename = "default-features")]
+    pub default_features: Option<bool>,
+    pub link: Option<Kind>,
 }
 
 const TARGET_NAMES: [&str; 5] = ["windows", "macos", "linux", "unix", "emscripten"];
@@ -166,6 +176,8 @@ pub enum Os {
 }
 
 impl Os {
+    pub const ALL: [Os; 5] = [Os::Windows, Os::MacOs, Os::Linux, Os::Unix, Os::Emscripten];
+
     pub fn host() -> Os {
         if cfg!(windows) {
             Os::Windows
@@ -186,6 +198,10 @@ impl Os {
             Os::Unix => "unix",
             Os::Emscripten => "emscripten",
         }
+    }
+
+    pub fn supports_shared(self) -> bool {
+        self != Os::Emscripten
     }
 }
 #[derive(Deserialize)]
@@ -221,20 +237,15 @@ impl Types {
 }
 
 impl Package {
-    /// What this package is built as: the dependents' choice, else the first listed type. A test is an executable.
+    /// What this package is built as: the dependents' choice, else the first listed type.
     pub fn kind(&self) -> Kind {
-        let kind = self.chosen.unwrap_or_else(|| {
+        self.chosen.unwrap_or_else(|| {
             self.types
                 .list()
                 .first()
                 .copied()
                 .unwrap_or(Kind::Executable)
-        });
-        if kind == Kind::Test {
-            Kind::Executable
-        } else {
-            kind
-        }
+        })
     }
 
     pub fn is_test(&self) -> bool {
@@ -243,9 +254,7 @@ impl Package {
 
     fn check(&self) -> Result<()> {
         let kinds = self.types.list();
-        let libraries = kinds
-            .iter()
-            .all(|kind| !matches!(kind, Kind::Executable | Kind::Test));
+        let libraries = kinds.iter().all(|kind| !kind.is_program());
         let unique = kinds
             .iter()
             .enumerate()
@@ -467,30 +476,11 @@ impl Manifest {
         }
         let targets = std::mem::take(&mut self.target);
 
-        // The defaults only apply when nothing, on any platform or in any feature, says otherwise, so they
-        // don't differ per OS or per feature set.
         let names_sources = |s: &Sources| s.dirs.is_some() || !s.files.is_empty();
-        let features = || {
-            self.feature
-                .values()
-                .chain(targets.values().flat_map(|t| t.feature.values()))
-        };
-        let (in_overlays, include_in_overlays) = (
-            targets.values().any(|t| names_sources(&t.sources))
-                || features().any(|f| names_sources(&f.sources)),
-            targets.values().any(|t| t.include.is_some())
-                || features().any(|f| f.include.is_some()),
-        );
         if !names_sources(&self.sources) {
-            self.sources.dirs = Some(if in_overlays {
-                Vec::new()
-            } else {
-                vec!["src".into()]
-            });
+            self.sources.dirs = Some(vec!["src".into()]);
         }
-        if self.include.is_none() && include_in_overlays {
-            self.include = Some(Include::default());
-        }
+        self.include_defaults = self.include.is_none();
 
         let mut order = Vec::new();
         if os != "windows" {
@@ -553,6 +543,10 @@ impl Manifest {
                         bail!("[target.{name}.dependencies] {key}: conflicts with the entry in [dependencies]");
                     }
                     dep.public = extra.public.unwrap_or(dep.public);
+                    dep.default_features = extra.default_features.unwrap_or(dep.default_features);
+                    if extra.link.is_some() {
+                        dep.link = extra.link;
+                    }
                     dep.features.extend(extra.features.iter().cloned());
                 }
                 None => {
@@ -561,8 +555,8 @@ impl Manifest {
                         version: extra.version.clone(),
                         public: extra.public.unwrap_or(false),
                         features: extra.features.clone(),
-                        default_features: true,
-                        link: None,
+                        default_features: extra.default_features.unwrap_or(true),
+                        link: extra.link,
                     };
                     if dep.path.is_some() == dep.version.is_some() {
                         bail!(
@@ -592,24 +586,44 @@ impl Manifest {
             if dep.path.is_some() == dep.version.is_some() {
                 bail!("dependency '{key}' needs exactly one of path and version");
             }
-            if matches!(dep.link, Some(Kind::Executable | Kind::Test)) {
+            if dep.link.is_some_and(Kind::is_program) {
                 bail!("dependency '{key}': link must be \"static\" or \"shared\"");
+            }
+        }
+        for (target_name, target) in &self.target {
+            for (key, dep) in &target.dependencies {
+                if dep.link.is_some_and(Kind::is_program) {
+                    bail!(
+                        "[target.{target_name}.dependencies] {key}: link must be \"static\" or \"shared\""
+                    );
+                }
             }
         }
         Ok(())
     }
 
-    /// Fixes what the package is built as: the `link` its dependents ask for, else its first type.
-    pub fn link(&mut self, wanted: Option<Kind>) -> Result<()> {
-        if let Some(kind) = wanted {
-            if !self.package.types.list().contains(&kind) {
-                bail!(
-                    "package '{}' cannot be built as {kind:?}; it offers {:?}",
-                    self.package.name,
-                    self.package.types.list()
-                );
+    /// Fixes what the package is built as: the `link` its dependents ask for, else the first offered type `os` supports.
+    pub fn link(&mut self, wanted: Option<Kind>, os: Os) -> Result<()> {
+        let offered = self.package.types.list();
+        match wanted {
+            Some(kind) => {
+                if !offered.contains(&kind) {
+                    bail!(
+                        "package '{}' cannot be built as {kind:?}; it offers {:?}",
+                        self.package.name,
+                        offered
+                    );
+                }
+                self.package.chosen = Some(kind);
             }
-            self.package.chosen = Some(kind);
+            None => {
+                if let Some(kind) = offered
+                    .into_iter()
+                    .find(|&kind| kind != Kind::Shared || os.supports_shared())
+                {
+                    self.package.chosen = Some(kind);
+                }
+            }
         }
         if self.package.kind() == Kind::Shared {
             let defines = self.build.shared_defines.clone();
@@ -671,7 +685,8 @@ mod tests {
         let manifest: Manifest = toml::from_str(text).unwrap();
         manifest.check().unwrap();
         assert!(manifest.package.is_test());
-        assert_eq!(manifest.package.kind(), Kind::Executable);
+        assert_eq!(manifest.package.kind(), Kind::Test);
+        assert!(manifest.package.kind().is_program());
         assert_eq!(manifest.test.timeout, Some(5));
 
         let plain: Manifest =
@@ -826,41 +841,63 @@ w = { path = "deps/w" }
     }
 
     #[test]
-    fn default_source_dir_ignores_which_os_adds_files() {
-        let mut manifest: Manifest =
-            toml::from_str("[package]\nname = \"x\"\n[target.windows]\nsources.files = [\"w.c\"]")
-                .unwrap();
-        manifest.resolve("linux").unwrap();
-        assert_eq!(manifest.sources.dirs.as_deref(), Some(&[][..]));
-        assert!(manifest.sources.files.is_empty());
-        let mut manifest: Manifest = toml::from_str("[package]\nname = \"x\"").unwrap();
+    fn target_overlays_keep_base_source_and_include_defaults() {
+        let mut manifest: Manifest = toml::from_str(
+            "[package]\nname = \"x\"\n[target.emscripten]\nsources.files = [\"w.c\"]\ninclude.private = [\"web\"]",
+        )
+        .unwrap();
         manifest.resolve("linux").unwrap();
         assert_eq!(
             manifest.sources.dirs.as_deref(),
             Some(&["src".to_string()][..])
         );
+        assert!(manifest.sources.files.is_empty());
+        assert!(manifest.include_defaults && manifest.include.is_none());
+
+        let mut wasm: Manifest = toml::from_str(
+            "[package]\nname = \"x\"\n[target.emscripten]\nsources.files = [\"w.c\"]\ninclude.private = [\"web\"]",
+        )
+        .unwrap();
+        wasm.resolve("emscripten").unwrap();
+        assert_eq!(wasm.sources.dirs.as_deref(), Some(&["src".to_string()][..]));
+        assert_eq!(wasm.sources.files, ["w.c"]);
+        assert!(wasm.include_defaults);
+        assert_eq!(wasm.include.unwrap().private, ["web"]);
     }
 
     #[test]
-    fn libraries_offer_types_and_dependents_choose() {
+    fn libraries_offer_types_and_choose_target_supported_defaults() {
         let text = "[package]\nname = \"sdl\"\ntype = [\"shared\", \"static\"]\n[build]\nshared_defines = [\"EXPORT\"]\n";
-        let build = |link: Option<Kind>| {
+        let build = |link: Option<Kind>, os: Os| {
             let mut manifest: Manifest = toml::from_str(text).unwrap();
             manifest.check().unwrap();
-            manifest.link(link).map(|_| manifest)
+            manifest.link(link, os).map(|_| manifest)
         };
-        let default = build(None).unwrap();
+        let default = build(None, Os::Linux).unwrap();
         assert_eq!(default.package.kind(), Kind::Shared);
         assert_eq!(default.build.defines, ["EXPORT"]);
-        let fixed = build(Some(Kind::Static)).unwrap();
+        let wasm_default = build(None, Os::Emscripten).unwrap();
+        assert_eq!(wasm_default.package.kind(), Kind::Static);
+        assert!(wasm_default.build.defines.is_empty());
+        let fixed = build(Some(Kind::Static), Os::Linux).unwrap();
         assert_eq!(fixed.package.kind(), Kind::Static);
         assert!(fixed.build.defines.is_empty());
         let mut only: Manifest =
             toml::from_str("[package]\nname = \"lua\"\ntype = \"static\"").unwrap();
-        assert!(only.link(Some(Kind::Shared)).is_err());
+        assert!(only.link(Some(Kind::Shared), Os::Linux).is_err());
         let mixed: Manifest =
             toml::from_str("[package]\nname = \"x\"\ntype = [\"executable\", \"static\"]").unwrap();
         assert!(mixed.check().is_err());
+
+        let mut target_override: Manifest = toml::from_str(
+            "[package]\nname = \"app\"\n[dependencies]\nsdl = { path = \"deps/sdl\" }\n\
+             [target.emscripten.dependencies]\nsdl = { link = \"static\", default-features = false }",
+        )
+        .unwrap();
+        target_override.check().unwrap();
+        target_override.resolve("emscripten").unwrap();
+        assert_eq!(target_override.dependencies["sdl"].link, Some(Kind::Static));
+        assert!(!target_override.dependencies["sdl"].default_features);
     }
 
     #[test]

@@ -5,7 +5,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::commands::out_dir;
-use crate::config::Kind;
 use crate::dag::compile_scope;
 use crate::scanner::{self, is_header, Pkg, Workspace};
 use crate::toolchain::{Arch, Toolchain};
@@ -114,7 +113,7 @@ pub fn generate_for(root_dir: &Path, member_dirs: &[PathBuf], archs: &[Arch]) ->
         projects.push(Project {
             name: pkg.name.clone(),
             builds: ws.roots.contains(&index),
-            executable: pkg.kind == Kind::Executable,
+            executable: pkg.kind.is_program(),
         });
     }
     // Visual Studio starts the first project of the solution, so programs go first.

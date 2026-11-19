@@ -399,7 +399,7 @@ impl Model {
             baseline: None,
         };
         model.apply_source_defaults(kind_flag, in_deps);
-        model.export = model.kind != Kind::Executable;
+        model.export = !model.kind.is_program();
         model.apply_include_defaults();
         model
     }
@@ -418,18 +418,13 @@ impl Model {
         let nodes = scan_tree(root);
         let count = nodes.len();
         let parent_toml = registrable_parent(root);
-        let kind = if manifest.package.is_test() {
-            Kind::Test
-        } else {
-            manifest.package.kind()
-        };
         let mut model = Model {
             root: root.to_path_buf(),
             nodes,
             choice: vec![None; count],
             include: vec![false; count],
             name: manifest.package.name.clone(),
-            kind,
+            kind: manifest.package.kind(),
             std: manifest.package.cxx_standard.get(),
             defines: manifest.build.defines.join(", "),
             libs: manifest.build.libs.join(", "),
@@ -590,7 +585,7 @@ impl Model {
             None if !in_deps && any_main => Kind::Executable,
             None => Kind::Static,
         };
-        if self.kind != Kind::Executable {
+        if !self.kind.is_program() {
             for index in 0..self.nodes.len() {
                 if self.nodes[index].has_main {
                     self.choice[index] = Some(false);

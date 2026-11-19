@@ -120,7 +120,7 @@ inputs = ["schema/*.in"]
 outputs = ["{stem}.gen.hpp", "{stem}.gen.cpp"]
 ```
 
-`nomake` invokes `tool --out-dir <gen_dir> --depfile <file> -I<dir>... <input>`.
+`nomake` invokes `tool --out-dir <gen_dir> --depfile <file> -I<dir>... <input>`. When cross-compiling (such as `-a wasm32` or `-a arm64`), generator tools and their dependencies are compiled for the host automatically.
 
 ### Target tables
 
@@ -169,7 +169,7 @@ nomake add lua      # adds lua = { version = "5.4" } and writes nomake.lock
 nomake update lua   # updates within 5.4.x
 ```
 
-Libraries that support both linkage modes set `type = ["shared", "static"]` (with optional `[build] shared_defines`); dependents can select `link = "static"` or `link = "shared"`.
+Libraries that support both linkage modes set `type = ["shared", "static"]` (with optional `[build] shared_defines`), defaulting to `shared` on native targets and falling back to `static` on targets without shared libraries (`wasm32`). Dependents can override with `link = "static"` or `link = "shared"` (in `[dependencies]` or `[target.<os>.dependencies]`).
 
 | Environment variable | Description |
 | --- | --- |
@@ -184,7 +184,7 @@ Libraries that support both linkage modes set `type = ["shared", "static"]` (wit
 
 ## Emscripten (`-a wasm32`)
 
-Activate `emsdk` so `em++` and `emar` are on `PATH`, then build with `-a wasm32`:
+`nomake build -a wasm32` uses `em++` and `emar` from `PATH`. When `em++` is not found (and `CXX` / `[toolchain] cxx` are unset), nomake clones and activates the latest emsdk into `NOMAKE_HOME/emsdk` once (set `EMSDK` to use an existing install instead):
 
 ```
 nomake build -a wasm32
@@ -192,14 +192,14 @@ nomake run -a wasm32
 nomake test -a wasm32
 ```
 
-Executables output `build/wasm32-<profile>/<name>.html` alongside `<name>.js` and `<name>.wasm` (plus `<name>.data` when `--preload-file` is used). `nomake run -a wasm32` and `nomake test -a wasm32` execute `<name>.js` with `node`; serve `<name>.html` over HTTP for browser apps.
+Executables output `build/wasm32-<profile>/<name>.html` alongside `<name>.js` and `<name>.wasm` (plus `<name>.data` when `--preload-file` is used); `type = "test"` packages output `<name>.js` and `<name>.wasm` directly. `nomake run -a wasm32` and `nomake test -a wasm32` execute `<name>.js` with `node`; serve `<name>.html` over HTTP for browser apps. `-sALLOW_MEMORY_GROWTH=1` is enabled by default.
 
 ```toml
 [target.emscripten.build]
-link_flags = ["--embed-file", "assets", "-sALLOW_MEMORY_GROWTH=1"]
+link_flags = ["--embed-file", "assets"]
 ```
 
-Files passed to `--shell-file`, `--pre-js`, `--post-js`, `--js-library`, `--embed-file`, and `--preload-file` are tracked as link inputs so edits trigger relinking. Shared libraries are not supported on Emscripten; use `type = "static"` or `link = "static"`.
+Paths passed to `--shell-file`, `--pre-js`, `--post-js`, `--js-library`, `--embed-file`, and `--preload-file` resolve relative to the package that declares them and are tracked as link inputs so edits, additions, or deletions trigger relinking. Shared-only libraries (`type = "shared"`) are rejected on Emscripten; dual-mode libraries (`["shared", "static"]`) automatically build as `static`.
 
 ## Visual Studio & Workspaces
 

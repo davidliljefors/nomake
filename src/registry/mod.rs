@@ -31,7 +31,7 @@ pub struct Located {
 }
 
 /// `NOMAKE_HOME`, else the per-user cache directory.
-fn cache_dir() -> Result<PathBuf> {
+pub(crate) fn cache_dir() -> Result<PathBuf> {
     if let Some(home) = env::var_os("NOMAKE_HOME") {
         return Ok(PathBuf::from(home));
     }
@@ -71,6 +71,8 @@ pub struct Resolver {
     lock: Lock,
     src: PathBuf,
     jobs: Vec<fetch::Job>,
+    /// Located jobs held back during `lock_only` passes; fetched only if a nested `path` manifest is missing.
+    deferred: Vec<fetch::Job>,
     /// Locate without queueing sources: for locking the dependencies of targets that are not being built.
     lock_only: bool,
 }
@@ -89,6 +91,7 @@ impl Resolver {
             lock,
             src: cache_dir()?.join("src"),
             jobs: Vec::new(),
+            deferred: Vec::new(),
             lock_only: false,
         })
     }
@@ -121,7 +124,9 @@ impl Resolver {
         });
         let job = fetch::Job::new(&self.src, name, &recipe.version, source);
         let root = job.dest.clone();
-        if !self.lock_only {
+        if self.lock_only {
+            self.deferred.push(job);
+        } else {
             self.jobs.push(job);
         }
         Ok(Located {
@@ -133,6 +138,31 @@ impl Resolver {
     /// Fetches the sources of every located dependency that isn't in the cache yet, in parallel.
     pub fn fetch(&mut self) -> Result<()> {
         fetch::fetch_all(&std::mem::take(&mut self.jobs))
+    }
+
+    /// Fetches only deferred packages whose cached source tree is needed to read a nested `path` manifest in `level`.
+    pub fn fetch_for_paths(&mut self, level: &[(PathBuf, PathBuf)]) -> Result<()> {
+        let missing: Vec<&Path> = level
+            .iter()
+            .filter_map(|(_, file)| (!file.is_file()).then_some(file.as_path()))
+            .collect();
+        if missing.is_empty() || self.deferred.is_empty() {
+            return Ok(());
+        }
+        let mut needed = Vec::new();
+        let mut kept = Vec::new();
+        for job in std::mem::take(&mut self.deferred) {
+            if missing.iter().any(|file| file.starts_with(&job.dest)) {
+                needed.push(job);
+            } else {
+                kept.push(job);
+            }
+        }
+        self.deferred = kept;
+        if needed.is_empty() {
+            return Ok(());
+        }
+        fetch::fetch_all(&needed)
     }
 
     /// Writes `nomake.lock`.
@@ -294,6 +324,136 @@ mod tests {
 
         crate::scanner::update(&project, &[]).unwrap();
         assert!(lock().contains("5.4.8") && lock().contains("base"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lock_covers_all_targets_and_fetches_only_nested_path_sources_on_demand() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = env::temp_dir().join(format!("nomake_lock_other_path_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+
+        let make_repo = |name: &str, files: &[(&str, &str)]| {
+            let repo = root.join(format!("{name}-source"));
+            fs::create_dir_all(&repo).unwrap();
+            for (file, text) in files {
+                let path = repo.join(file);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, text).unwrap();
+            }
+            let git = |args: &[&str]| {
+                run(Command::new("git").args(args).current_dir(&repo)).unwrap();
+            };
+            git(&["init", "-q"]);
+            git(&["add", "."]);
+            git(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "x",
+            ]);
+            let output = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            (
+                repo,
+                String::from_utf8(output.stdout).unwrap().trim().to_string(),
+            )
+        };
+        let (web_repo, web_rev) = make_repo(
+            "web",
+            &[
+                (
+                    "nomake.toml",
+                    "[package]\nname = \"web\"\ntype = \"static\"\n[dependencies]\nlocal = { path = \"local\" }\n",
+                ),
+                (
+                    "local/nomake.toml",
+                    "[package]\nname = \"local\"\ntype = \"static\"\n[dependencies]\nnested = { version = \"1\" }\n",
+                ),
+            ],
+        );
+        let (leaf_repo, leaf_rev) = make_repo(
+            "leaf",
+            &[(
+                "nomake.toml",
+                "[package]\nname = \"leaf\"\ntype = \"static\"\n",
+            )],
+        );
+
+        env::set_var("NOMAKE_HOME", root.join("home"));
+        let registry = root.join("registry");
+        env::set_var("NOMAKE_REGISTRY", &registry);
+        let publish = |name: &str, repo: &Path, rev: &str, dependencies: &str| {
+            let dir = registry.join(name).join("1.0.0");
+            fs::create_dir_all(&dir).unwrap();
+            let git = repo.display().to_string().replace('\\', "/");
+            fs::write(
+                dir.join("nomake.toml"),
+                format!(
+                    "[package]\nname = \"{name}\"\ntype = \"static\"\n{dependencies}[source]\ngit = \"{git}\"\nrev = \"{rev}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        publish("winonly", &leaf_repo, &leaf_rev, "");
+        publish("maconly", &leaf_repo, &leaf_rev, "");
+        publish(
+            "web",
+            &web_repo,
+            &web_rev,
+            "[dependencies]\nlocal = { path = \"local\" }\n",
+        );
+        publish("nested", &leaf_repo, &leaf_rev, "");
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("nomake.toml"),
+            "[package]\nname = \"app\"\n\
+             [target.windows.dependencies]\nwinonly = { version = \"1\" }\n\
+             [target.macos.dependencies]\nmaconly = { version = \"1\" }\n\
+             [target.emscripten.dependencies]\nweb = { version = \"1\" }\n",
+        )
+        .unwrap();
+        let lock_file = project.join("nomake.lock");
+        let sources = root.join("home/src");
+
+        crate::scanner::load(&project, Os::Linux).unwrap();
+        let lock = fs::read_to_string(&lock_file).unwrap();
+        for expected in ["winonly", "maconly", "web", "nested"] {
+            assert!(lock.contains(expected), "missing {expected} in:\n{lock}");
+        }
+        let fetched: Vec<String> = fs::read_dir(&sources)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            fetched.len(),
+            1,
+            "only `web` needed a source fetch for its nested path manifest, got {fetched:?}"
+        );
+        assert!(fetched[0].starts_with("web-1.0.0-"));
+
+        publish(
+            "web",
+            &web_repo,
+            &web_rev,
+            "[dependencies]\nbroken = { path = \"missing\" }\n",
+        );
+        let error = crate::scanner::update(&project, &[])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("missing") && error.contains("not found"));
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -6,9 +6,37 @@ use std::process::Command;
 use crate::config::{self, Crt, Kind, Os};
 use crate::Result;
 
+mod emscripten;
 mod flags;
 
 use flags::*;
+
+/// How a built target is executed by `nomake run` or `nomake test`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Launch {
+    Native(PathBuf),
+    Node(PathBuf),
+    Unsupported {
+        artifact: PathBuf,
+        reason: &'static str,
+    },
+}
+
+impl Launch {
+    pub fn command(&self) -> Result<Command> {
+        match self {
+            Launch::Native(exe) => Ok(Command::new(exe)),
+            Launch::Node(js) => {
+                let mut command = Command::new("node");
+                command.arg(js);
+                Ok(command)
+            }
+            Launch::Unsupported { artifact, reason } => {
+                bail!("{} cannot be run directly ({reason})", artifact.display())
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Family {
@@ -184,7 +212,7 @@ fn family_of(cxx: &str) -> Family {
     }
 }
 
-fn which(name: &str, path_var: &OsStr) -> Option<PathBuf> {
+pub(super) fn which(name: &str, path_var: &OsStr) -> Option<PathBuf> {
     let direct = Path::new(name);
     if direct.components().count() > 1 {
         return direct.is_file().then(|| direct.to_path_buf());
@@ -198,17 +226,6 @@ fn which(name: &str, path_var: &OsStr) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Whether `name` is a compiler wrapper around Emscripten, judged by what `--version` prints.
-fn is_emscripten_wrapper(name: &str, path_var: &OsStr) -> bool {
-    which(name, path_var)
-        .and_then(|path| Command::new(path).arg("--version").output().ok())
-        .is_some_and(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .to_lowercase()
-                .contains("emscripten")
-        })
 }
 
 /// Environment of the MSVC developer prompt for `arch`, built by running vcvarsall.
@@ -405,54 +422,43 @@ fn target_args_for(family: Family, arch: Arch, os: Os) -> Result<Vec<String>> {
     }
 }
 
-/// `path` itself, or every file under it when it is a directory.
-fn collect_files(path: &Path, into: &mut Vec<PathBuf>) {
-    if path.is_dir() {
-        let mut entries: Vec<PathBuf> = fs::read_dir(path)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-            .collect();
-        entries.sort();
-        for entry in entries {
-            collect_files(&entry, into);
-        }
-    } else if path.is_file() {
-        into.push(path.to_path_buf());
-    }
-}
-
-fn single_file(link_flags: &[String]) -> bool {
-    link_flags.iter().enumerate().any(|(i, flag)| {
-        let setting = match flag.as_str() {
-            "-s" => link_flags.get(i + 1).map(String::as_str),
-            _ => flag.strip_prefix("-s"),
-        };
-        matches!(setting, Some("SINGLE_FILE" | "SINGLE_FILE=1"))
-    })
-}
-
 impl Toolchain {
     /// Order: `CXX` env var, `[toolchain] cxx`, then the target's default (clang++, cl, g++ / clang++, g++, c++ / em++).
     /// `cache` is a writable directory for probe results that outlive one build.
     pub fn detect(cfg: &config::Toolchain, arch: Arch, cache: &Path) -> Result<Toolchain> {
+        Self::detect_inner(cfg, arch, cache, false)
+    }
+
+    /// Detects a native compiler on the host for building `[[generate]]` tools during cross-builds.
+    pub fn detect_host(cfg: &config::Toolchain, cache: &Path) -> Result<Toolchain> {
+        Self::detect_inner(cfg, Arch::host(), cache, true)
+    }
+
+    fn detect_inner(
+        cfg: &config::Toolchain,
+        arch: Arch,
+        cache: &Path,
+        ignore_wasm_env: bool,
+    ) -> Result<Toolchain> {
         let os = arch.os();
         let host_path = std::env::var_os("PATH").unwrap_or_default();
+        let env_cxx = std::env::var("CXX").ok().filter(|name| {
+            !ignore_wasm_env
+                || (family_of(name) != Family::Emscripten
+                    && !emscripten::is_wrapper(name, &host_path))
+        });
         // A native compiler in CXX / cxx must not break `-a wasm32`: ignore it unless it is Emscripten's.
-        let requested = std::env::var("CXX")
-            .ok()
-            .or_else(|| cfg.cxx.clone())
-            .filter(|name| {
-                os != Os::Emscripten
-                    || family_of(name) == Family::Emscripten
-                    || is_emscripten_wrapper(name, &host_path)
-            });
+        let requested = env_cxx.or_else(|| cfg.cxx.clone()).filter(|name| {
+            os != Os::Emscripten
+                || family_of(name) == Family::Emscripten
+                || emscripten::is_wrapper(name, &host_path)
+        });
         let defaults: &[&str] = match os {
             Os::Emscripten => &["em++"],
             Os::Windows => &["clang++", "cl", "g++"],
             _ => &["clang++", "g++", "c++"],
         };
+        let requested_none = requested.is_none();
         let candidates: Vec<String> = match requested {
             Some(name) => vec![name],
             None => defaults.iter().map(|&name| name.to_string()).collect(),
@@ -471,6 +477,17 @@ impl Toolchain {
             }
             let mut env = Vec::new();
             let mut path_var = std::env::var_os("PATH").unwrap_or_default();
+            if family == Family::Emscripten
+                && requested_none
+                && which(candidate, &path_var).is_none()
+            {
+                env = emscripten::provision()?;
+                path_var = env
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("path"))
+                    .map(|(_, value)| value.into())
+                    .unwrap_or(path_var);
+            }
             if matches!(family, Family::Msvc | Family::ClangCl) && !ambient_env_matches(arch) {
                 let Ok(vcvars) = cached_vcvars(arch, cache) else {
                     continue;
@@ -571,12 +588,14 @@ impl Toolchain {
 
     /// (file to produce, file other packages link against)
     pub fn artifact(&self, kind: Kind, name: &str) -> Result<(String, String)> {
+        if self.os == Os::Emscripten {
+            return emscripten::artifact(kind, name);
+        }
         let coff = self.os == Os::Windows && self.family != Family::Gcc;
         Ok(match kind {
             Kind::Executable | Kind::Test => {
                 let file = match self.os {
                     Os::Windows => format!("{name}.exe"),
-                    Os::Emscripten => format!("{name}.html"),
                     _ => name.to_string(),
                 };
                 (file.clone(), file)
@@ -590,9 +609,6 @@ impl Toolchain {
                 (file.clone(), file)
             }
             Kind::Shared => match self.os {
-                Os::Emscripten => bail!(
-                    "Emscripten cannot build shared libraries; use type = \"static\" (or link = \"static\")"
-                ),
                 Os::Windows => {
                     let dll = format!("{name}.dll");
                     let import_lib = if coff {
@@ -606,7 +622,7 @@ impl Toolchain {
                     let file = format!("lib{name}.dylib");
                     (file.clone(), file)
                 }
-                Os::Linux | Os::Unix => {
+                Os::Linux | Os::Unix | Os::Emscripten => {
                     let file = format!("lib{name}.so");
                     (file.clone(), file)
                 }
@@ -614,54 +630,56 @@ impl Toolchain {
         })
     }
 
-    /// Files the link writes besides `<name>.html`: `.js`, `.wasm` and `.data` (unless `-sSINGLE_FILE` folds them in).
-    pub fn side_outputs(&self, name: &str, link_flags: &[String]) -> Vec<String> {
-        if self.os != Os::Emscripten || single_file(link_flags) {
-            return Vec::new();
+    pub fn rebase_link_flags(
+        &self,
+        flags: &[String],
+        pkg_dir: &Path,
+        root_dir: &Path,
+    ) -> Vec<String> {
+        if self.family == Family::Emscripten {
+            emscripten::rebase_link_flags(flags, pkg_dir, root_dir)
+        } else {
+            flags.to_vec()
         }
-        let mut files = vec![format!("{name}.js"), format!("{name}.wasm")];
-        if link_flags
-            .iter()
-            .any(|flag| flag.starts_with("--preload-file"))
-        {
-            files.push(format!("{name}.data"));
-        }
-        files
     }
 
-    /// Files named by Emscripten link flags (`--shell-file`, `--embed-file`, etc.) that the link reads.
-    pub fn link_inputs(&self, flags: &[String], dir: &Path) -> Vec<PathBuf> {
-        if self.family != Family::Emscripten {
-            return Vec::new();
+    /// Files the link writes besides the primary artifact.
+    pub fn side_outputs(&self, kind: Kind, name: &str, link_flags: &[String]) -> Vec<String> {
+        if self.os == Os::Emscripten {
+            emscripten::side_outputs(kind, name, link_flags)
+        } else {
+            Vec::new()
         }
-        const FILE_OPTIONS: [&str; 6] = [
-            "--shell-file",
-            "--pre-js",
-            "--post-js",
-            "--js-library",
-            "--embed-file",
-            "--preload-file",
-        ];
-        let mut inputs = Vec::new();
-        let mut words = flags.iter();
-        while let Some(word) = words.next() {
-            let Some(&option) = FILE_OPTIONS.iter().find(|option| {
-                word.strip_prefix(**option)
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
-            }) else {
-                continue;
-            };
-            let value = match word[option.len()..].strip_prefix('=') {
-                Some(value) => value,
-                None => match words.next() {
-                    Some(value) => value,
-                    None => break,
-                },
-            };
-            let source = value.split('@').next().unwrap_or(value);
-            collect_files(&dir.join(source), &mut inputs);
+    }
+
+    /// Host files read by linker flags (such as Emscripten `--embed-file` or `--js-library`).
+    pub fn link_inputs(&self, flags: &[String], root_dir: &Path) -> Vec<PathBuf> {
+        if self.family == Family::Emscripten {
+            emscripten::link_inputs(flags, root_dir)
+        } else {
+            Vec::new()
         }
-        inputs
+    }
+
+    /// Adds nomake's full-page HTML template when an Emscripten executable sets no `--shell-file`.
+    pub fn default_shell(
+        &self,
+        kind: Kind,
+        flags: &mut Vec<String>,
+        out_dir: &Path,
+        root_dir: &Path,
+    ) -> Result<()> {
+        if self.os == Os::Emscripten {
+            emscripten::push_default_shell(kind, flags, out_dir, root_dir)?;
+        }
+        Ok(())
+    }
+
+    pub fn launch(&self, kind: Kind, out: &Path, link_flags: &[String]) -> Option<Launch> {
+        if self.os == Os::Emscripten {
+            return emscripten::launch(kind, out, link_flags);
+        }
+        kind.is_program().then(|| Launch::Native(out.to_path_buf()))
     }
 
     pub fn compile_args(&self, spec: &CompileSpec) -> Vec<String> {
@@ -780,7 +798,7 @@ impl Toolchain {
         args.extend(spec.libs.iter().map(|lib| path_string(lib)));
         args.extend(spec.sys_libs.iter().map(|name| (dialect.sys_lib)(name)));
         if spec.crt == Crt::Static
-            && spec.kind == Kind::Executable
+            && spec.kind.is_program()
             && self.linker.is_none()
             && !matches!(self.os, Os::MacOs | Os::Emscripten)
         {
@@ -789,8 +807,8 @@ impl Toolchain {
         if let (Some(opt), Some(subsystem)) = (dialect.subsystem, spec.subsystem) {
             opt.push(&mut args, subsystem);
         }
-        if self.family == Family::Emscripten && spec.release {
-            args.push("-O2".into());
+        if self.family == Family::Emscripten {
+            emscripten::push_link_defaults(&mut args, spec.flags, spec.release);
         }
         args.extend(spec.flags.iter().cloned());
         if self.linker.is_none() && self.os == Os::Linux {
@@ -861,14 +879,25 @@ mod tests {
 
         let tc = Toolchain::for_tests(Family::Emscripten);
         assert_eq!(tc.artifact(Kind::Executable, "app").unwrap().0, "app.html");
+        assert_eq!(tc.artifact(Kind::Test, "suite").unwrap().0, "suite.js");
         assert_eq!(tc.artifact(Kind::Static, "lib").unwrap().0, "liblib.a");
         assert!(tc.artifact(Kind::Shared, "x").is_err());
-        assert_eq!(tc.side_outputs("x", &[]), ["x.js", "x.wasm"]);
         assert_eq!(
-            tc.side_outputs("x", &["--preload-file".into(), "assets".into()]),
+            tc.side_outputs(Kind::Executable, "x", &[]),
+            ["x.js", "x.wasm"]
+        );
+        assert_eq!(tc.side_outputs(Kind::Test, "x", &[]), ["x.wasm"]);
+        assert_eq!(
+            tc.side_outputs(
+                Kind::Executable,
+                "x",
+                &["--preload-file".into(), "assets".into()]
+            ),
             ["x.js", "x.wasm", "x.data"]
         );
-        assert!(tc.side_outputs("x", &["-sSINGLE_FILE=1".into()]).is_empty());
+        assert!(tc
+            .side_outputs(Kind::Executable, "x", &["-sSINGLE_FILE=1".into()])
+            .is_empty());
 
         let link = tc.link_args(&LinkSpec {
             kind: Kind::Executable,
@@ -876,14 +905,58 @@ mod tests {
             objs: &[PathBuf::from("a.o")],
             libs: &[],
             sys_libs: &[],
-            flags: &["-sALLOW_MEMORY_GROWTH=1".to_string()],
+            flags: &[],
             release: true,
             crt: Crt::Static,
             subsystem: None,
         });
+        assert!(link.contains(&"-sALLOW_MEMORY_GROWTH=1".to_string()));
         assert!(
             !link.contains(&"-static".to_string()) && !link.iter().any(|a| a.contains("rpath"))
         );
+
+        let root = std::env::temp_dir().join(format!("nomake_rebase_{}", std::process::id()));
+        let pkg = root.join("members/app");
+        let rebased = tc.rebase_link_flags(
+            &[
+                "--embed-file".into(),
+                "assets".into(),
+                "--js-library=js/lib.js".into(),
+            ],
+            &pkg,
+            &root,
+        );
+        assert_eq!(
+            rebased,
+            [
+                "--embed-file",
+                "members/app/assets@assets",
+                "--js-library=members/app/js/lib.js"
+            ]
+        );
+    }
+
+    #[test]
+    fn emscripten_link_inputs_track_directories_and_missing_files() {
+        let dir = std::env::temp_dir().join(format!("nomake_link_inputs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("assets/nested")).unwrap();
+        std::fs::write(dir.join("assets/nested/file.txt"), "").unwrap();
+        let tc = Toolchain::for_tests(Family::Emscripten);
+        let flags = ["--embed-file".into(), "assets".into()];
+        let inputs = tc.link_inputs(&flags, &dir);
+        assert!(inputs.contains(&dir.join("assets")));
+        assert!(inputs.contains(&dir.join("assets/nested")));
+
+        std::fs::remove_file(dir.join("assets/nested/file.txt")).unwrap();
+        let inputs = tc.link_inputs(&flags, &dir);
+        assert!(inputs.contains(&dir.join("assets/nested")));
+
+        let missing = ["--embed-file=gone.txt".into()];
+        assert!(tc
+            .link_inputs(&missing, &dir)
+            .contains(&dir.join("gone.txt")));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

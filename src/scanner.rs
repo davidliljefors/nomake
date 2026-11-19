@@ -78,6 +78,13 @@ pub fn load_roots(lock_dir: &Path, roots: &[PathBuf], os: Os) -> Result<Workspac
     load_with(lock_dir, roots, None, os)
 }
 
+/// Loads host-executable generator tools against the already-resolved lockfile without rewriting `nomake.lock`.
+pub fn load_host_tools(lock_dir: &Path, roots: &[PathBuf]) -> Result<Workspace> {
+    let mut resolver = registry::Resolver::new(lock_dir, None)?;
+    let (manifests, links) = read_manifests(roots, &mut resolver, Os::host(), true)?;
+    finish_workspace(manifests, &links, roots)
+}
+
 /// Re-resolves registry dependencies against the newest registry (all of them when `names` is empty) and rewrites `nomake.lock`.
 pub fn update(root: &Path, names: &[String]) -> Result<()> {
     load_with(
@@ -96,24 +103,25 @@ fn load_with(
     os: Os,
 ) -> Result<Workspace> {
     let mut resolver = registry::Resolver::new(lock_dir, update)?;
-    let (manifests, links) = read_manifests(roots, &mut resolver, os)?;
-    resolver.fetch()?;
-    // Lock what the other targets need as well, so switching targets neither drops nor re-resolves entries.
-    // Their sources are fetched when they are built; a problem there only matters to `nomake update`.
+    let (manifests, links) = read_manifests(roots, &mut resolver, os, true)?;
+    // Lock every target OS so switching platforms or targets neither drops nor churns `nomake.lock`.
+    // Registry recipes stay unfetched unless one references a nested `path` manifest inside its source tree.
     resolver.lock_only();
-    for other in [Os::host(), Os::Emscripten]
-        .into_iter()
-        .filter(|&other| other != os)
-    {
-        let locked = read_manifests(roots, &mut resolver, other);
-        if update.is_some() {
-            locked?;
-        }
+    for other in Os::ALL.into_iter().filter(|&other| other != os) {
+        read_manifests(roots, &mut resolver, other, false)?;
     }
     resolver.save()?;
+    finish_workspace(manifests, &links, roots)
+}
+
+fn finish_workspace(
+    manifests: HashMap<PathBuf, Manifest>,
+    links: &Links,
+    roots: &[PathBuf],
+) -> Result<Workspace> {
     let mut loader = Loader {
         manifests,
-        links: &links,
+        links,
         pkgs: Vec::new(),
         cfgs: Vec::new(),
         done: HashMap::new(),
@@ -171,6 +179,7 @@ fn read_manifests(
     roots: &[PathBuf],
     resolver: &mut registry::Resolver,
     os: Os,
+    fetch_each_level: bool,
 ) -> Result<(HashMap<PathBuf, Manifest>, Links)> {
     let mut all = HashMap::new();
     let mut links = Links::new();
@@ -182,6 +191,7 @@ fn read_manifests(
         .map(|root| (root.clone(), root.join("nomake.toml")))
         .collect();
     while !level.is_empty() {
+        resolver.fetch_for_paths(&level)?;
         let read = level
             .into_par_iter()
             .map(|(dir, file)| -> Result<(PathBuf, Manifest)> {
@@ -219,6 +229,9 @@ fn read_manifests(
             }
             all.insert(dir, manifest);
         }
+        if fetch_each_level {
+            resolver.fetch()?;
+        }
     }
     // Features only add files and flags, never dependencies, so they can be switched on once every
     // dependent has been seen. A package's features are the union of what its dependents ask for.
@@ -231,7 +244,7 @@ fn read_manifests(
         let link = features
             .link()
             .map_err(|e| format!("{}: {e}", manifest.package.name))?;
-        manifest.link(link)?;
+        manifest.link(link, os)?;
     }
     Ok((all, links))
 }
@@ -331,10 +344,23 @@ impl Loader<'_> {
         let resolve = |paths: &[String]| -> Vec<PathBuf> {
             paths.iter().map(|path| absolute(&dir.join(path))).collect()
         };
-        let (include_public, include_private) = match &manifest.include {
-            Some(include) => (resolve(&include.public), resolve(&include.private)),
-            None => (existing(&["include"]), existing(&["src"])),
+        let (mut include_public, mut include_private) = if manifest.include_defaults {
+            (existing(&["include"]), existing(&["src"]))
+        } else {
+            (Vec::new(), Vec::new())
         };
+        if let Some(include) = &manifest.include {
+            for path in resolve(&include.public) {
+                if !include_public.contains(&path) {
+                    include_public.push(path);
+                }
+            }
+            for path in resolve(&include.private) {
+                if !include_private.contains(&path) {
+                    include_private.push(path);
+                }
+            }
+        }
 
         let kind = manifest.package.kind();
         let idx = self.pkgs.len();

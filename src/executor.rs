@@ -365,8 +365,10 @@ impl<'a> Ctx<'a> {
             Some(path) => cmd.arg(format!("@{}", path.display())),
             None => cmd.args(node.args().iter()),
         };
-        cmd.current_dir(&node.cwd)
-            .envs(self.graph.env.iter().cloned());
+        cmd.current_dir(&node.cwd);
+        if let Some(env) = &node.env {
+            cmd.envs(env.vars.iter().cloned());
+        }
         let output = match cmd.output() {
             Ok(output) => output,
             Err(err) => {
@@ -402,8 +404,11 @@ impl<'a> Ctx<'a> {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned();
-                let (text, deps) =
-                    split_show_includes(&stdout, &self.graph.sys_includes, &src_name);
+                let sys_includes = node
+                    .env
+                    .as_ref()
+                    .map_or(&[][..], |env| env.sys_includes.as_slice());
+                let (text, deps) = split_show_includes(&stdout, sys_includes, &src_name);
                 stdout = text;
                 deps
             }

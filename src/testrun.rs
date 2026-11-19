@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::commands::{self, BuildOpts};
 use crate::config::{TestConfig, DEFAULT_TEST_TIMEOUT};
+use crate::toolchain::Launch;
 use crate::Result;
 
 pub struct Test {
@@ -37,9 +38,14 @@ fn drain<R: Read + Send + 'static>(mut from: R, sink: Sink) -> JoinHandle<()> {
     })
 }
 
-/// Runs `exe` in the test's folder with stdout and stderr captured, and kills it after the timeout.
-fn run_one(exe: &Path, test: &Test, extra: &[String]) -> Result<(Outcome, String)> {
-    let mut command = commands::launcher(exe)?;
+/// Runs `launch` in the test's folder with stdout and stderr captured, and kills it after the timeout.
+fn run_one(
+    launch: &Launch,
+    artifact: &Path,
+    test: &Test,
+    extra: &[String],
+) -> Result<(Outcome, String)> {
+    let mut command = launch.command()?;
     command
         .args(&test.config.args)
         .args(extra)
@@ -49,7 +55,7 @@ fn run_one(exe: &Path, test: &Test, extra: &[String]) -> Result<(Outcome, String
         .stderr(Stdio::piped());
     let mut child = command
         .spawn()
-        .map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+        .map_err(|e| format!("cannot start {}: {e}", artifact.display()))?;
     let sink: Sink = Arc::default();
     let readers = [
         drain(child.stdout.take().unwrap(), sink.clone()),
@@ -98,13 +104,20 @@ pub fn run(mut opts: BuildOpts, tests: &[Test], extra: &[String]) -> Result<i32>
     let mut failed = Vec::new();
     println!();
     for test in tests {
-        let Some((_, exe)) = built.targets.iter().find(|(dir, _)| *dir == test.dir) else {
+        let Some(target) = built
+            .targets
+            .iter()
+            .find(|target| target.pkg_dir == test.dir)
+        else {
             bail!("internal: no build output for test '{}'", test.name);
+        };
+        let Some(launch) = &target.launch else {
+            bail!("internal: test '{}' is not runnable", test.name);
         };
         print!("test {} ... ", test.name);
         std::io::stdout().flush()?;
         let start = Instant::now();
-        let (outcome, output) = run_one(exe, test, extra)?;
+        let (outcome, output) = run_one(launch, &target.artifact, test, extra)?;
         let took = start.elapsed();
         match &outcome {
             Outcome::Passed => println!("ok ({took:.2?})"),

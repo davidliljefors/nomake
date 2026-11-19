@@ -165,9 +165,7 @@ pub fn test(root: &Root, names: &[String], opts: BuildOpts, extra: &[String]) ->
 pub fn run(root: &Root, names: &[String], mut opts: BuildOpts, args: &[String]) -> Result<i32> {
     let programs: Vec<&Member> = select(root, names)?
         .into_iter()
-        .filter(|member| {
-            member.kind == Kind::Executable && (member.test.is_none() || !names.is_empty())
-        })
+        .filter(|member| member.kind.is_program() && (member.test.is_none() || !names.is_empty()))
         .collect();
     let Some(member) = programs.first() else {
         bail!("no executable to run in this workspace");
