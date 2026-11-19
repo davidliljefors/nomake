@@ -119,10 +119,20 @@ pub fn run(mut opts: BuildOpts, tests: &[Test], extra: &[String]) -> Result<i32>
         let start = Instant::now();
         let (outcome, output) = run_one(launch, &target.artifact, test, extra)?;
         let took = start.elapsed();
+        let summary = output
+            .lines()
+            .rev()
+            .find_map(|line| line.strip_prefix("tests: "))
+            .map(|rest| format!("{rest}, "))
+            .unwrap_or_default();
         match &outcome {
-            Outcome::Passed => println!("ok ({took:.2?})"),
-            Outcome::Failed(Some(code)) => println!("FAILED (exit code {code}, {took:.2?})"),
-            Outcome::Failed(None) => println!("FAILED (terminated abnormally, {took:.2?})"),
+            Outcome::Passed => println!("ok ({summary}{took:.2?})"),
+            Outcome::Failed(Some(code)) => {
+                println!("FAILED ({summary}exit code {code}, {took:.2?})")
+            }
+            Outcome::Failed(None) => {
+                println!("FAILED ({summary}terminated abnormally, {took:.2?})")
+            }
             Outcome::TimedOut(limit) => println!("FAILED (timed out after {limit}s)"),
         }
         let passed = matches!(outcome, Outcome::Passed);

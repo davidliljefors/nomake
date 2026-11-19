@@ -185,6 +185,48 @@ fn native_example_builds_and_runs() {
 }
 
 #[test]
+fn test_packages_get_a_runner_with_filtering_and_crash_isolation() {
+    let sandbox = Sandbox::new("runner");
+    sandbox.write(
+        "suite/nomake.toml",
+        "[package]\nname = \"suite\"\ntype = \"test\"\n",
+    );
+    sandbox.write(
+        "suite/src/a.c",
+        "#include <nomake/tests.h>\n\
+         TEST(passes) { TEST_CHECK(1 + 1 == 2); }\n\
+         TEST(skips) { TEST_SKIP(\"later\"); }\n",
+    );
+    sandbox.write(
+        "suite/src/b.cpp",
+        "#include <nomake/tests.h>\nTEST(cpp_passes) { TEST_CHECK(true); }\n",
+    );
+    let pass = sandbox.nomake("suite", &["test"], None);
+    if text(&pass).contains("no C++ compiler found") {
+        return;
+    }
+    assert!(pass.status.success(), "{}", text(&pass));
+    assert!(text(&pass).contains("2 passed, 0 failed, 1 skipped"));
+
+    sandbox.write(
+        "suite/src/c.c",
+        "#include <nomake/tests.h>\n\
+         TEST(soft) { TEST_CHECK_MSG(1 == 2, \"got %d\", 7); }\n\
+         TEST(crash) { volatile int *p = 0; *p = 1; }\n",
+    );
+    let fail = sandbox.nomake("suite", &["test"], None);
+    assert!(!fail.status.success());
+    let out = text(&fail);
+    assert!(out.contains("FAIL soft: 1 == 2 (got 7)"), "{out}");
+    assert!(out.contains("CRASH crash"), "{out}");
+    assert!(out.contains("2 passed, 2 failed, 1 skipped"), "{out}");
+
+    let filtered = sandbox.nomake("suite", &["test", "--", "--filter", "*passes"], None);
+    assert!(filtered.status.success(), "{}", text(&filtered));
+    assert!(text(&filtered).contains("2 passed, 0 failed, 0 skipped"));
+}
+
+#[test]
 fn wasm_builds_through_a_shim_in_a_path_with_spaces_and_ignores_a_native_cxx() {
     let sandbox = Sandbox::new("shim");
     wasm_project(&sandbox, "app", "[]");
@@ -404,7 +446,10 @@ fn wasm_falls_back_to_static_for_dual_mode_libs_and_runs_host_generators_and_js_
         "suite/nomake.toml",
         "[package]\nname = \"suite\"\ntype = \"test\"\n",
     );
-    sandbox.write("suite/src/test.cpp", "int main() { return 0; }\n");
+    sandbox.write(
+        "suite/src/test.cpp",
+        "#include <nomake/tests.h>\nTEST(ok) { TEST_CHECK(true); }\n",
+    );
     let test = sandbox.nomake("suite", &["test", "-a", "wasm32"], None);
     assert!(test.status.success(), "{}", text(&test));
     assert!(sandbox.exists("suite/build/wasm32-debug/suite.js"));

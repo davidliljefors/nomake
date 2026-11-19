@@ -527,13 +527,32 @@ fn step_node(
     }
 }
 
+const TESTS_H: &str = include_str!("testsupport/tests.h");
+const TEST_RUNNER_C: &str = include_str!("testsupport/runner.c");
+
+/// Writes the test runner next to the package's generated files and returns the path of its source.
+/// Files are only rewritten when their content changes so they don't invalidate the build.
+fn write_test_support(gen_dir: &Path) -> Result<PathBuf> {
+    let dir = gen_dir.join("nomake");
+    std::fs::create_dir_all(&dir)?;
+    for (name, text) in [("tests.h", TESTS_H), ("runner.c", TEST_RUNNER_C)] {
+        let path = dir.join(name);
+        if std::fs::read_to_string(&path).map_or(true, |old| old != text) {
+            std::fs::write(&path, text)?;
+        }
+    }
+    Ok(util::absolute(&dir.join("runner.c")))
+}
+
 /// Include directories and defines every compile of package `pkg_idx` sees; `gen_root` holds each package's generated files.
 pub fn compile_scope(
     ws: &Workspace,
     pkg_idx: usize,
     gen_root: &Path,
 ) -> (Vec<PathBuf>, Vec<String>) {
-    let gen_dir = |pkg: &Pkg| (!pkg.generate.is_empty()).then(|| gen_root.join(&pkg.name));
+    let gen_dir = |pkg: &Pkg| {
+        (!pkg.generate.is_empty() || pkg.kind == Kind::Test).then(|| gen_root.join(&pkg.name))
+    };
     let pkg = &ws.pkgs[pkg_idx];
     let mut includes: Vec<PathBuf> = pkg
         .include_private
@@ -710,6 +729,10 @@ fn emit_workspace(pass: &Pass, acc: &mut GraphAcc) -> Result<Vec<Built>> {
             }
         }
 
+        if pkg.kind == Kind::Test {
+            sources.push((write_test_support(&gen_dir)?, None));
+        }
+
         let mut includes = includes;
         let pch = match &pkg.pch {
             Some(header) => {
@@ -828,9 +851,10 @@ fn emit_workspace(pass: &Pass, acc: &mut GraphAcc) -> Result<Vec<Built>> {
         let compiled: Vec<(Node, PathBuf)> = sources
             .par_iter()
             .map(|(src, producer)| {
-                let rel = match producer {
-                    Some(_) => format!("gen/{}", rel_str(&gen_dir, src)),
-                    None => rel_str(&pkg.root, src),
+                let rel = if producer.is_some() || src.starts_with(&gen_dir) {
+                    format!("gen/{}", rel_str(&gen_dir, src))
+                } else {
+                    rel_str(&pkg.root, src)
                 };
                 let mut obj = out_dir.join("obj").join(&pkg.name);
                 obj.extend(rel.split('/'));

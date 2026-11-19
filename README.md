@@ -201,6 +201,38 @@ link_flags = ["--embed-file", "assets"]
 
 Paths passed to `--shell-file`, `--pre-js`, `--post-js`, `--js-library`, `--embed-file`, and `--preload-file` resolve relative to the package that declares them and are tracked as link inputs so edits, additions, or deletions trigger relinking. Shared-only libraries (`type = "shared"`) are rejected on Emscripten; dual-mode libraries (`["shared", "static"]`) automatically build as `static`.
 
+## Tests
+
+A package with `type = "test"` is a test suite. nomake adds a runner that provides `main`, so test files never write one (a `main` of your own is a duplicate-symbol link error). Tests register themselves; C and C++ both work, with no setup:
+
+```c
+#include <nomake/tests.h>
+
+TEST(adds) {
+    TEST_CHECK(1 + 1 == 2);
+}
+
+TEST(parses) {
+    TEST_REQUIRE(parse("42") != NULL);        // ends this test on failure
+    TEST_CHECK_MSG(value == 42, "got %d", value);
+}
+
+TEST(needs_gpu) {
+    TEST_SKIP("no GPU on this machine");
+}
+```
+
+`TEST_CHECK` records a failure and keeps going, `TEST_REQUIRE` stops the test. Anything else (comparing, memcmp, formatting) is plain code in the condition. A crash (segfault, divide by zero, abort) fails that test and the rest still run; wasm32 has no crash isolation.
+
+```
+nomake test                          # run every test package
+nomake test -- --filter parse        # name substring, or a glob like "parse_*"
+nomake test -- --list                # list test names
+nomake test -- --verbose             # list each test as it runs
+```
+
+The suite exits 1 when any test fails or when none are registered.
+
 ## Visual Studio & Workspaces
 
 ```
