@@ -6,12 +6,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::commands::{self, BuildOpts};
 use crate::config::{Kind, Manifest, Os, TestConfig, Toolchain, WorkspaceDef};
-use crate::testrun::{self, Test};
-use crate::toolchain::Arch;
 use crate::util::{self, absolute, rel_str};
-use crate::{vs, Result};
+use crate::Result;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,7 +31,6 @@ pub struct Member {
     pub test: Option<TestConfig>,
 }
 
-#[allow(dead_code)]
 pub struct Project {
     pub root_dir: PathBuf,
     pub is_workspace: bool,
@@ -373,74 +369,17 @@ pub(crate) fn select_items(
     Ok(chosen)
 }
 
-/// The workspace rooted at `dir`, if its nomake.toml has a `[workspace]` table.
-pub fn find(dir: &Path, os: Os) -> Result<Option<Project>> {
-    if !dir.join("nomake.toml").is_file() {
-        return Ok(None);
+impl Project {
+    pub fn member_dirs(&self) -> Vec<PathBuf> {
+        self.members.iter().map(|m| m.dir.clone()).collect()
     }
-    let project = Project::discover(dir, os)?;
-    Ok((project.is_workspace && project.root_dir == absolute(dir)).then_some(project))
-}
 
-fn dirs(members: &[&Member]) -> Vec<PathBuf> {
-    members.iter().map(|member| member.dir.clone()).collect()
-}
-
-/// One build of the chosen members (all by default, except tests): a single graph, so shared dependencies compile once.
-pub fn build(root: &Project, names: &[String], mut opts: BuildOpts) -> Result<i32> {
-    let mut members = root.select(&root.root_dir, names)?;
-    if names.is_empty() {
-        members.retain(|member| member.test.is_none());
-    }
-    opts.refresh_compdb = names.is_empty();
-    opts.roots = dirs(&members);
-    Ok(if commands::build(&opts)?.ok { 0 } else { 1 })
-}
-
-/// Builds and runs the test members named by `names`, or every test member when none are given.
-pub fn test(root: &Project, names: &[String], opts: BuildOpts, extra: &[String]) -> Result<i32> {
-    let mut tests = Vec::new();
-    for member in root.select(&root.root_dir, names)? {
-        match &member.test {
-            Some(config) => tests.push(Test {
-                name: member.name.clone(),
-                dir: member.dir.clone(),
-                config: config.clone(),
-            }),
-            None if !names.is_empty() => {
-                bail!("'{}' is not a test (set type = \"test\")", member.name)
-            }
-            None => {}
+    pub fn effective_toolchain(&self, pkg_tc: &Toolchain) -> Toolchain {
+        Toolchain {
+            cxx: pkg_tc.cxx.clone().or_else(|| self.toolchain.cxx.clone()),
+            ar: pkg_tc.ar.clone().or_else(|| self.toolchain.ar.clone()),
         }
     }
-    testrun::run(opts, &tests, extra)
-}
-
-pub fn run(root: &Project, names: &[String], mut opts: BuildOpts, args: &[String]) -> Result<i32> {
-    let programs: Vec<&Member> = root
-        .select(&root.root_dir, names)?
-        .into_iter()
-        .filter(|member| member.kind.is_program() && (member.test.is_none() || !names.is_empty()))
-        .collect();
-    let Some(member) = programs.first() else {
-        bail!("no executable to run in this workspace");
-    };
-    opts.refresh_compdb = false;
-    opts.roots = vec![member.dir.clone()];
-    commands::run(&opts, args, Some(&member.dir))
-}
-
-pub fn compdb(root: &Project, arch: Arch, release: bool) -> Result<()> {
-    let all: Vec<&Member> = root.members.iter().collect();
-    commands::compdb(arch, release, &dirs(&all))
-}
-
-pub fn solution(root: &Project, archs: &[Arch]) -> Result<()> {
-    vs::generate_for(
-        &root.root_dir,
-        &dirs(&root.members.iter().collect::<Vec<_>>()),
-        archs,
-    )
 }
 
 #[cfg(test)]
@@ -609,7 +548,7 @@ mod tests {
 
         // Syntax error is never swallowed.
         write(&root, "broken/nomake.toml", "[workspace\n");
-        assert!(find(&root.join("broken"), Os::host()).is_err());
+        assert!(Project::discover(&root.join("broken"), Os::host()).is_err());
 
         // Nested pure `[workspace]` listed as a member.
         write(

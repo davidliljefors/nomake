@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use crate::commands::{self, BuildOpts};
 use crate::config::{TestConfig, DEFAULT_TEST_TIMEOUT};
 use crate::toolchain::Launch;
+use crate::workspace::Project;
 use crate::Result;
 
 pub struct Test {
@@ -90,14 +91,13 @@ fn run_one(
 
 /// Builds `tests` as one graph and runs them in order; `extra` goes to every test after its own `args`.
 /// The result is the exit code: 0 when every test passed.
-pub fn run(mut opts: BuildOpts, tests: &[Test], extra: &[String]) -> Result<i32> {
+pub fn run(project: &Project, opts: &BuildOpts, tests: &[Test], extra: &[String]) -> Result<i32> {
     if tests.is_empty() {
         bail!("no test packages (a package with type = \"test\" is one)");
     }
-    opts.refresh_compdb = false;
-    opts.roots = tests.iter().map(|test| test.dir.clone()).collect();
+    let test_dirs: Vec<PathBuf> = tests.iter().map(|test| test.dir.clone()).collect();
     let verbose = opts.verbose;
-    let built = commands::build(&opts)?;
+    let built = commands::build_roots(project, &test_dirs, opts)?;
     if !built.ok {
         return Ok(1);
     }

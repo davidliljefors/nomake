@@ -8,7 +8,7 @@ use crate::commands::out_dir;
 use crate::dag::compile_scope;
 use crate::scanner::{self, is_header, Pkg, Workspace};
 use crate::toolchain::{Arch, Toolchain};
-use crate::util::{absolute, hash, hash_seeded};
+use crate::util::{hash, hash_seeded};
 use crate::Result;
 
 const CPP_PROJECT_TYPE: &str = "{8BC9CEB8-8B4A-11D0-9A44-00A0C91F9C40}";
@@ -73,11 +73,6 @@ struct Project {
     /// Part of the solution build; packages that are only dependencies are browse-only.
     builds: bool,
     executable: bool,
-}
-
-pub fn generate(archs: &[Arch]) -> Result<()> {
-    let root_dir = absolute(Path::new("."));
-    generate_for(&root_dir, std::slice::from_ref(&root_dir), archs)
 }
 
 /// One solution in `root_dir` holding the packages in `member_dirs`, all building into its build/.

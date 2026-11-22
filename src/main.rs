@@ -37,28 +37,32 @@ COMMANDS:
     update [name...]             Update locked dependencies
     list | search | info         Inspect registry dependencies
     cache clean                  Remove cached dependency sources
-    build [-r] [-a ARCH] [-j N]  Build project
-    run [-r] [-a ARCH] [-- args] Build and run executable
-    test [-r] [-a ARCH] [-- args] Build and run tests
-    compdb [-r] [-a ARCH]        Generate compile_commands.json
-    vs [-a ARCH,...]             Generate Visual Studio solution in build/vs/
-    clean [-r] [-a ARCH]         Remove build artifacts
+    build [pkg...] [-r] [-a ARCH] [-j N]  Build packages
+    run [pkg] [-r] [-a ARCH] [-- args]    Build and run executable
+    test [pkg...] [-r] [-a ARCH] [-- args] Build and run tests
+    compdb [-r] [-a ARCH]                 Generate compile_commands.json
+    vs [-a ARCH,...]                      Generate Visual Studio solution in build/vs/
+    clean [pkg...] [-r] [-a ARCH]         Remove build artifacts
 
 OPTIONS:
-    -r, --release    Release build
-    -a, --arch ARCH  Target architecture: x64, x86, arm64, wasm32
-    -j, --jobs N     Parallel jobs (default: all cores)
-    -v, --verbose    Print executed commands
-    -d explain       Explain why targets rebuild
-    -d stats         Print phase timing
-    -y, --yes        Accept defaults in init
-    -V, --version    Print version
+    -r, --release       Release build
+    -a, --arch ARCH     Target architecture: x64, x86, arm64, wasm32
+    -p, --package PKG   Target package (repeatable)
+    -w, --workspace     Operate on the whole workspace
+    -j, --jobs N        Parallel jobs (default: all cores)
+    -v, --verbose       Print executed commands
+    -d explain          Explain why targets rebuild
+    -d stats            Print phase timing
+    -y, --yes           Accept defaults in init
+    -V, --version       Print version
 ";
 
 #[derive(Default)]
 struct Args {
     release: bool,
     archs: Vec<Arch>,
+    packages: Vec<String>,
+    workspace: bool,
     jobs: Option<usize>,
     verbose: bool,
     debug: executor::Debug,
@@ -110,10 +114,18 @@ fn parse(argv: Vec<String>) -> Result<Args> {
             "-a" | "--arch" => args.archs.extend(parse_archs(
                 &remaining.next().ok_or("--arch needs a value")?,
             )?),
+            "-p" | "--package" => args
+                .packages
+                .push(remaining.next().ok_or("--package needs a value")?),
+            "-w" | "--workspace" => args.workspace = true,
             "--bin" => args.kind = Some(Kind::Executable),
             "--lib" | "--static" => args.kind = Some(Kind::Static),
             "--shared" => args.kind = Some(Kind::Shared),
             text if text.starts_with("--arch=") => args.archs.extend(parse_archs(&text[7..])?),
+            text if text.starts_with("--package=") => args.packages.push(text[10..].to_string()),
+            text if text.starts_with("-p") && text.len() > 2 => {
+                args.packages.push(text[2..].to_string())
+            }
             text if text.starts_with("-j") => args.jobs = Some(text[2..].parse()?),
             text if text.starts_with('-') => bail!("unknown option {text}"),
             other => args.positional.push(other.to_string()),
@@ -129,25 +141,57 @@ fn real_main() -> Result<i32> {
         return Ok(0);
     };
     let args = parse(argv.collect())?;
+    match command.as_str() {
+        "help" | "-h" | "--help" => {
+            print!("{USAGE}");
+            return Ok(0);
+        }
+        "-V" | "--version" => {
+            println!("nomake {}", env!("CARGO_PKG_VERSION"));
+            return Ok(0);
+        }
+        "init" => return init::init(args.yes, args.kind).map(|_| 0),
+        "new" => {
+            let Some(name) = args.positional.first() else {
+                bail!("usage: nomake new <name>")
+            };
+            if args.positional.len() > 1 {
+                bail!("usage: nomake new <name>");
+            }
+            return commands::new(name, args.kind.unwrap_or(Kind::Executable)).map(|_| 0);
+        }
+        "configure" => return init::configure().map(|_| 0),
+        "add" | "update" | "list" | "search" | "info" | "cache" => {
+            let mut words = vec![command.clone()];
+            words.extend(args.positional.iter().cloned());
+            return registry::command(&words, &std::env::current_dir()?).map(|_| 0);
+        }
+        "build" | "b" | "run" | "r" | "test" | "t" | "clean" | "compdb" | "vs" => {}
+        other => bail!("unknown command '{other}' (try `nomake help`)"),
+    }
+
     let here = util::absolute(std::path::Path::new("."));
-    let workspace = match command.as_str() {
-        "build" | "b" | "run" | "r" | "test" | "t" | "clean" | "compdb" | "vs" => workspace::find(
-            &here,
-            args.archs.first().map_or(Os::host(), |arch| arch.os()),
-        )?,
-        _ => None,
-    };
+    let target_os = args.archs.first().map_or(Os::host(), |arch| arch.os());
+    let project = workspace::Project::discover(&here, target_os)?;
+
+    let mut selectors = args.packages.clone();
+    selectors.extend(args.positional.iter().cloned());
+    if args.workspace && !selectors.is_empty() {
+        bail!("cannot combine '--workspace' with package selectors");
+    }
+
     if command == "vs" {
+        if !selectors.is_empty() {
+            bail!("'nomake vs' covers the whole workspace and takes no package selectors");
+        }
         let archs = if args.archs.is_empty() {
             vec![Arch::host()]
         } else {
             args.archs
         };
-        if let Some(root) = &workspace {
-            return workspace::solution(root, &archs).map(|_| 0);
-        }
-        return vs::generate(&archs).map(|_| 0);
+        return vs::generate_for(&project.root_dir, &project.member_dirs(), &archs).map(|_| 0);
     }
+
     let arch = single_arch(&args)?;
     let opts = BuildOpts {
         release: args.release,
@@ -155,50 +199,42 @@ fn real_main() -> Result<i32> {
         jobs: args.jobs,
         verbose: args.verbose,
         debug: args.debug,
-        roots: Vec::new(),
-        refresh_compdb: true,
     };
-    if let Some(root) = &workspace {
-        let config = (!args.archs.is_empty() || args.release).then_some((arch, args.release));
-        return match command.as_str() {
-            "build" | "b" => workspace::build(root, &args.positional, opts),
-            "run" | "r" => workspace::run(root, &args.positional, opts, &args.rest),
-            "test" | "t" => workspace::test(root, &args.positional, opts, &args.rest),
-            "clean" => commands::clean(config).map(|_| 0),
-            _ => workspace::compdb(root, arch, args.release).map(|_| 0),
-        };
-    }
     match command.as_str() {
-        "build" | "b" => Ok(if commands::build(&opts)?.ok { 0 } else { 1 }),
-        "run" | "r" => commands::run(&opts, &args.rest, None),
-        "test" | "t" => commands::test(opts, &args.rest),
+        "build" | "b" => Ok(
+            if commands::build(&project, &here, &selectors, args.workspace, &opts)?.ok {
+                0
+            } else {
+                1
+            },
+        ),
+        "run" | "r" => commands::run(
+            &project,
+            &here,
+            &selectors,
+            args.workspace,
+            &opts,
+            &args.rest,
+        ),
+        "test" | "t" => commands::test(
+            &project,
+            &here,
+            &selectors,
+            args.workspace,
+            &opts,
+            &args.rest,
+        ),
         "clean" => {
             let config = (!args.archs.is_empty() || args.release).then_some((arch, args.release));
-            commands::clean(config).map(|_| 0)
+            commands::clean(&project, &here, &selectors, config).map(|_| 0)
         }
-        "compdb" => commands::compdb(arch, args.release, &[]).map(|_| 0),
-        "init" => init::init(args.yes, args.kind).map(|_| 0),
-        "configure" => init::configure().map(|_| 0),
-        "add" | "update" | "list" | "search" | "info" | "cache" => {
-            let mut words = vec![command.clone()];
-            words.extend(args.positional.iter().cloned());
-            registry::command(&words, &std::env::current_dir()?).map(|_| 0)
+        "compdb" => {
+            if !selectors.is_empty() {
+                bail!("'nomake compdb' covers the whole workspace and takes no package selectors");
+            }
+            commands::compdb(&project, arch, args.release).map(|_| 0)
         }
-        "new" => {
-            let Some(name) = args.positional.first() else {
-                bail!("usage: nomake new <name>")
-            };
-            commands::new(name, args.kind.unwrap_or(Kind::Executable)).map(|_| 0)
-        }
-        "help" | "-h" | "--help" => {
-            print!("{USAGE}");
-            Ok(0)
-        }
-        "-V" | "--version" => {
-            println!("nomake {}", env!("CARGO_PKG_VERSION"));
-            Ok(0)
-        }
-        other => bail!("unknown command '{other}' (try `nomake help`)"),
+        _ => unreachable!(),
     }
 }
 

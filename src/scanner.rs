@@ -66,6 +66,50 @@ impl Workspace {
         }
         Ok(chosen.map_or_else(Default::default, |(_, mode)| mode))
     }
+
+    /// Keeps only `root_dirs` and their transitive dependencies/peers, remapping package indices.
+    pub fn retain_roots(&mut self, root_dirs: &[PathBuf]) {
+        let root_indices: Vec<usize> = root_dirs
+            .iter()
+            .filter_map(|dir| self.pkgs.iter().position(|pkg| pkg.root == *dir))
+            .collect();
+        let mut keep = vec![false; self.pkgs.len()];
+        let mut stack = root_indices.clone();
+        while let Some(idx) = stack.pop() {
+            if !keep[idx] {
+                keep[idx] = true;
+                for &dep in self.pkgs[idx].deps.iter().chain(&self.pkgs[idx].peers) {
+                    stack.push(dep);
+                }
+            }
+        }
+        let mut remap = vec![None; self.pkgs.len()];
+        let mut next = 0;
+        for (old, &kept) in keep.iter().enumerate() {
+            if kept {
+                remap[old] = Some(next);
+                next += 1;
+            }
+        }
+        let mut new_pkgs = Vec::with_capacity(next);
+        for (old, mut pkg) in self.pkgs.drain(..).enumerate() {
+            if keep[old] {
+                pkg.deps = pkg.deps.into_iter().map(|d| remap[d].unwrap()).collect();
+                pkg.reexports = pkg
+                    .reexports
+                    .into_iter()
+                    .map(|d| remap[d].unwrap())
+                    .collect();
+                pkg.peers = pkg.peers.into_iter().map(|d| remap[d].unwrap()).collect();
+                new_pkgs.push(pkg);
+            }
+        }
+        self.pkgs = new_pkgs;
+        self.roots = root_indices
+            .into_iter()
+            .map(|old| remap[old].unwrap())
+            .collect();
+    }
 }
 
 #[cfg(test)]
