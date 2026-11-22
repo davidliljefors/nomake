@@ -1098,9 +1098,9 @@ mod tests {
         };
         let alone = crate::scanner::load(&root.join("app"), Os::host()).unwrap();
         // Loading zed first gives it the lower package index.
+        let both = [root.join("zed"), root.join("app")];
         let with_zed_first =
-            crate::scanner::load_roots(&root, &[root.join("zed"), root.join("app")], Os::host())
-                .unwrap();
+            crate::scanner::load_project(&root, &both, &both, false, None, Os::host()).unwrap();
         assert_eq!(scope(&alone), scope(&with_zed_first));
         fs::remove_dir_all(root).unwrap();
     }

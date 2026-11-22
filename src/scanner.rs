@@ -24,7 +24,6 @@ pub struct Pkg {
     pub pch: Option<PathBuf>,
     pub link_flags: Vec<String>,
     pub libs: Vec<String>,
-    pub crt: Option<crate::config::Crt>,
     pub subsystem: Option<String>,
     pub generate: Vec<crate::config::Generate>,
     /// Indices into `Workspace::pkgs`; always lower than this package's own index.
@@ -34,12 +33,15 @@ pub struct Pkg {
     /// Packages from the root project's dependencies that this package's headers and defines come from, without linking or depending on them.
     pub peers: Vec<usize>,
     pub toolchain: Toolchain,
+    #[allow(dead_code)]
+    pub test_args: Vec<String>,
 }
 
 /// Packages in dependency order. `roots` are the packages that were asked for (one, or every workspace member).
 pub struct Workspace {
     pub pkgs: Vec<Pkg>,
     pub roots: Vec<usize>,
+    crts: Vec<(String, crate::config::Crt)>,
 }
 
 impl Workspace {
@@ -51,74 +53,140 @@ impl Workspace {
     /// The one C runtime mode the whole build uses; packages that name one must agree.
     pub fn crt(&self) -> Result<crate::config::Crt> {
         let mut chosen: Option<(&str, crate::config::Crt)> = None;
-        for pkg in &self.pkgs {
-            let Some(mode) = pkg.crt else { continue };
+        for (name, mode) in &self.crts {
             match chosen {
-                Some((first, other)) if other != mode => bail!(
-                    "crt: '{first}' wants {} but '{}' wants {}; one build uses one runtime",
+                Some((first, other)) if other != *mode => bail!(
+                    "crt: '{first}' wants {} but '{name}' wants {}; one build uses one runtime",
                     other.name(),
-                    pkg.name,
                     mode.name()
                 ),
                 Some(_) => {}
-                None => chosen = Some((&pkg.name, mode)),
+                None => chosen = Some((name.as_str(), *mode)),
             }
         }
         Ok(chosen.map_or_else(Default::default, |(_, mode)| mode))
     }
 }
 
+#[cfg(test)]
 pub fn load(root: &Path, os: Os) -> Result<Workspace> {
-    load_roots(root, std::slice::from_ref(&root.to_path_buf()), os)
+    let roots = [root.to_path_buf()];
+    load_project(root, &roots, &roots, true, None, os)
 }
 
-/// Loads several root packages into one set of packages, so a shared dependency exists once with the
-/// features and link kind every member asks for. The lock file lives in `lock_dir`.
-pub fn load_roots(lock_dir: &Path, roots: &[PathBuf], os: Os) -> Result<Workspace> {
-    load_with(lock_dir, roots, None, os)
+/// Resolves and locks the full workspace (`all_roots`) across every target OS so `nomake.lock` never
+/// churns on partial or test builds, then fetches and loads only the closure of `active_roots`.
+pub fn load_project(
+    lock_dir: &Path,
+    all_roots: &[PathBuf],
+    active_roots: &[PathBuf],
+    has_root_package: bool,
+    update: Option<&[String]>,
+    os: Os,
+) -> Result<Workspace> {
+    for root in all_roots {
+        if root != lock_dir && root.join("nomake.lock").is_file() {
+            eprintln!(
+                "nomake: warning: ignoring {}; workspace lockfile is {}",
+                root.join("nomake.lock").display(),
+                lock_dir.join("nomake.lock").display()
+            );
+        }
+    }
+    let mut resolver = registry::Resolver::new(lock_dir, update)?;
+    // Lock every member and target OS first; recipes stay unfetched unless one references a nested path manifest.
+    let (manifests, links) = read_manifests(all_roots, has_root_package, &mut resolver, os)?;
+    for other in Os::ALL.into_iter().filter(|&other| other != os) {
+        read_manifests(all_roots, has_root_package, &mut resolver, other)?;
+    }
+    resolver.save()?;
+    let reachable = reachable_dirs(active_roots, all_roots, &manifests, &links);
+    resolver.fetch_dirs(&reachable)?;
+    finish_workspace(manifests, &links, all_roots, active_roots, has_root_package)
 }
 
 /// Loads host-executable generator tools against the already-resolved lockfile without rewriting `nomake.lock`.
 pub fn load_host_tools(lock_dir: &Path, roots: &[PathBuf]) -> Result<Workspace> {
     let mut resolver = registry::Resolver::new(lock_dir, None)?;
-    let (manifests, links) = read_manifests(roots, &mut resolver, Os::host(), true)?;
-    finish_workspace(manifests, &links, roots)
+    let (manifests, links) = read_manifests(roots, true, &mut resolver, Os::host())?;
+    let reachable = reachable_dirs(roots, roots, &manifests, &links);
+    resolver.fetch_dirs(&reachable)?;
+    finish_workspace(manifests, &links, roots, roots, true)
 }
 
 /// Re-resolves registry dependencies against the newest registry (all of them when `names` is empty) and rewrites `nomake.lock`.
-pub fn update(root: &Path, names: &[String]) -> Result<()> {
-    load_with(
-        root,
-        std::slice::from_ref(&root.to_path_buf()),
+pub fn update(
+    lock_dir: &Path,
+    all_roots: &[PathBuf],
+    has_root_package: bool,
+    names: &[String],
+) -> Result<()> {
+    load_project(
+        lock_dir,
+        all_roots,
+        all_roots,
+        has_root_package,
         Some(names),
         Os::host(),
     )
     .map(|_| ())
 }
 
-fn load_with(
-    lock_dir: &Path,
-    roots: &[PathBuf],
-    update: Option<&[String]>,
-    os: Os,
-) -> Result<Workspace> {
-    let mut resolver = registry::Resolver::new(lock_dir, update)?;
-    let (manifests, links) = read_manifests(roots, &mut resolver, os, true)?;
-    // Lock every target OS so switching platforms or targets neither drops nor churns `nomake.lock`.
-    // Registry recipes stay unfetched unless one references a nested `path` manifest inside its source tree.
-    resolver.lock_only();
-    for other in Os::ALL.into_iter().filter(|&other| other != os) {
-        read_manifests(roots, &mut resolver, other, false)?;
+fn reachable_dirs(
+    active_roots: &[PathBuf],
+    all_roots: &[PathBuf],
+    manifests: &HashMap<PathBuf, Manifest>,
+    links: &Links,
+) -> HashSet<PathBuf> {
+    let mut visited = HashSet::new();
+    let mut stack: Vec<PathBuf> = active_roots.to_vec();
+    while let Some(dir) = stack.pop() {
+        if !visited.insert(dir.clone()) {
+            continue;
+        }
+        let Some(manifest) = manifests.get(&dir) else {
+            continue;
+        };
+        for key in manifest.dependencies.keys() {
+            if let Some(dep_dir) = links.get(&(dir.clone(), key.clone())) {
+                stack.push(dep_dir.clone());
+            }
+        }
+        for key in &manifest.peers {
+            if let Some(peer_dir) = all_roots
+                .iter()
+                .find_map(|root| links.get(&(root.clone(), key.clone())))
+            {
+                stack.push(peer_dir.clone());
+            }
+        }
     }
-    resolver.save()?;
-    finish_workspace(manifests, &links, roots)
+    visited
 }
 
 fn finish_workspace(
     manifests: HashMap<PathBuf, Manifest>,
     links: &Links,
-    roots: &[PathBuf],
+    all_roots: &[PathBuf],
+    active_roots: &[PathBuf],
+    has_root_package: bool,
 ) -> Result<Workspace> {
+    let mut crt_entries: Vec<(usize, String, crate::config::Crt)> = manifests
+        .iter()
+        .filter_map(|(dir, m)| {
+            let rank = all_roots
+                .iter()
+                .position(|r| r == dir)
+                .unwrap_or(usize::MAX);
+            Some((rank, m.package.name.clone(), m.build.crt?))
+        })
+        .collect();
+    crt_entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let crts = crt_entries
+        .into_iter()
+        .map(|(_, name, crt)| (name, crt))
+        .collect();
+
     let mut loader = Loader {
         manifests,
         links,
@@ -126,37 +194,33 @@ fn finish_workspace(
         cfgs: Vec::new(),
         done: HashMap::new(),
         stack: Vec::new(),
-        roots: roots.to_vec(),
+        roots: all_roots.to_vec(),
+        has_root_package,
     };
     let mut root_indices = Vec::new();
-    for root in roots {
+    for root in active_roots {
         root_indices.push(loader.load(root)?);
     }
     let Loader { mut pkgs, cfgs, .. } = loader;
     pkgs.par_iter_mut()
         .zip(cfgs)
         .for_each(|(p, c)| p.sources = collect_sources(&p.root, &c));
-    let mut names = HashSet::new();
-    for pkg in &pkgs {
-        if !names.insert(pkg.name.as_str()) {
-            bail!("two packages are named '{}' (two versions of one registry dependency? pin it in the root nomake.toml)", pkg.name);
-        }
-    }
     Ok(Workspace {
         pkgs,
         roots: root_indices,
+        crts,
     })
 }
 
 /// (package that lists the dependency, dependency key) -> the dependency's package root.
 type Links = HashMap<(PathBuf, String), PathBuf>;
 
-/// Finds a dependency's package root and the manifest describing it. Registry dependencies are fetched on the way.
+/// Finds a dependency's package root and the manifest describing it.
 fn locate(
     dir: &Path,
     key: &str,
     dep: &Dependency,
-    pins: &HashMap<String, String>,
+    pins: &HashMap<String, (String, String)>,
     resolver: &mut registry::Resolver,
 ) -> Result<(PathBuf, PathBuf)> {
     match (&dep.path, &dep.version) {
@@ -166,7 +230,8 @@ fn locate(
             Ok((root, file))
         }
         (None, Some(requirement)) => {
-            let located = resolver.locate(key, pins.get(key).unwrap_or(requirement))?;
+            let pinned = pins.get(key).map(|(_, req)| req).unwrap_or(requirement);
+            let located = resolver.locate(key, pinned)?;
             Ok((located.root, located.recipe))
         }
         _ => bail!("dependency '{key}' needs exactly one of path and version"),
@@ -174,17 +239,17 @@ fn locate(
 }
 
 /// Reads every manifest reachable from `roots`, one dependency level at a time, each level in parallel.
-/// Versions listed in a root manifest override what other packages ask for.
+/// Versions listed in a root manifest override what other packages ask for; conflicting root pins error.
 fn read_manifests(
     roots: &[PathBuf],
+    has_root_package: bool,
     resolver: &mut registry::Resolver,
     os: Os,
-    fetch_each_level: bool,
 ) -> Result<(HashMap<PathBuf, Manifest>, Links)> {
     let mut all = HashMap::new();
     let mut links = Links::new();
     let mut wanted: HashMap<PathBuf, Wanted> = HashMap::new();
-    let mut pins: HashMap<String, String> = HashMap::new();
+    let mut pins: HashMap<String, (String, String)> = HashMap::new();
     let mut seen: HashSet<PathBuf> = roots.iter().cloned().collect();
     let mut level: Vec<(PathBuf, PathBuf)> = roots
         .iter()
@@ -206,15 +271,30 @@ fn read_manifests(
             })
             .collect::<Result<Vec<_>>>()?;
         level = Vec::new();
-        // Every root's pins have to be known before any dependency is located.
+        // Every root's pins must be known and mutually compatible before any dependency is located.
         for (dir, manifest) in &read {
             if roots.contains(dir) {
-                pins.extend(
-                    manifest
-                        .dependencies
-                        .iter()
-                        .filter_map(|(key, dep)| Some((key.clone(), dep.version.clone()?))),
-                );
+                for (key, dep) in &manifest.dependencies {
+                    let Some(req) = &dep.version else { continue };
+                    match pins.get(key) {
+                        None => {
+                            pins.insert(key.clone(), (manifest.package.name.clone(), req.clone()));
+                        }
+                        Some((prev_pkg, prev_req)) => {
+                            if registry::version_matches(req, prev_req) {
+                                pins.insert(
+                                    key.clone(),
+                                    (manifest.package.name.clone(), req.clone()),
+                                );
+                            } else if !registry::version_matches(prev_req, req) {
+                                bail!(
+                                    "conflicting versions for '{key}': '{prev_pkg}' wants '{prev_req}' but '{}' wants '{req}'",
+                                    manifest.package.name
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         for (dir, manifest) in read {
@@ -225,12 +305,31 @@ fn read_manifests(
                     level.push((dep_dir.clone(), file));
                 }
                 links.insert((dir.clone(), key.clone()), dep_dir.clone());
-                wanted.entry(dep_dir).or_default().add(dep, from_root);
+                wanted
+                    .entry(dep_dir)
+                    .or_default()
+                    .add(&manifest.package.name, dep, from_root);
             }
             all.insert(dir, manifest);
         }
-        if fetch_each_level {
-            resolver.fetch()?;
+    }
+    // Check package name uniqueness across the full workspace and dependency graph.
+    let mut dirs_sorted: Vec<PathBuf> = all.keys().cloned().collect();
+    dirs_sorted.sort();
+    let mut by_name: HashMap<String, PathBuf> = HashMap::new();
+    for dir in &dirs_sorted {
+        let name = &all[dir].package.name;
+        if let Some(prev) = by_name.insert(name.clone(), dir.clone()) {
+            let hint = if has_root_package {
+                "in the root nomake.toml"
+            } else {
+                "in a workspace member's nomake.toml"
+            };
+            bail!(
+                "two packages are named '{name}': {} and {} (two versions of one registry dependency? pin it {hint})",
+                prev.display(),
+                dir.display()
+            );
         }
     }
     // Features only add files and flags, never dependencies, so they can be switched on once every
@@ -238,11 +337,12 @@ fn read_manifests(
     for root in roots {
         wanted.entry(root.clone()).or_default().defaults = true;
     }
-    for (dir, manifest) in &mut all {
+    for dir in &dirs_sorted {
+        let manifest = all.get_mut(dir).unwrap();
         let features = wanted.remove(dir).unwrap_or_default();
         manifest.enable(&features.names, features.defaults)?;
         let link = features
-            .link()
+            .link(has_root_package)
             .map_err(|e| format!("{}: {e}", manifest.package.name))?;
         manifest.link(link, os)?;
     }
@@ -255,32 +355,52 @@ struct Wanted {
     names: BTreeSet<String>,
     /// Default features stay on unless every dependent opts out.
     defaults: bool,
-    /// Link kinds asked for by the root project, and by other packages.
-    root_link: Option<Kind>,
+    /// `(member_name, kind)` asked for by root/workspace-member manifests.
+    root_links: Vec<(String, Kind)>,
     links: BTreeSet<String>,
 }
 
 impl Wanted {
-    fn add(&mut self, dep: &Dependency, from_root: bool) {
+    fn add(&mut self, dependent: &str, dep: &Dependency, from_root: bool) {
         self.names.extend(dep.features.iter().cloned());
         self.defaults |= dep.default_features;
         if let Some(kind) = dep.link {
             if from_root {
-                self.root_link = Some(kind);
+                self.root_links.push((dependent.to_string(), kind));
             }
             self.links.insert(kind.name().to_string());
         }
     }
 
-    /// The root's request wins; otherwise every dependent that asks must ask for the same.
-    fn link(&self) -> Result<Option<Kind>> {
-        if self.root_link.is_some() {
-            return Ok(self.root_link);
+    /// Root/member requests win when they agree; conflicting member requests error.
+    fn link(&self, has_root_package: bool) -> Result<Option<Kind>> {
+        if let Some((first_pkg, first_kind)) = self.root_links.first() {
+            for (other_pkg, other_kind) in &self.root_links[1..] {
+                if other_kind != first_kind {
+                    bail!(
+                        "conflicting link modes: '{first_pkg}' wants {} but '{other_pkg}' wants {}",
+                        first_kind.name(),
+                        other_kind.name()
+                    );
+                }
+            }
+            return Ok(Some(*first_kind));
         }
+        let hint = if has_root_package {
+            "in the root nomake.toml"
+        } else {
+            "in a workspace member's nomake.toml"
+        };
         match self.links.len() {
             0 => Ok(None),
-            1 => Ok(Some(if self.links.contains("shared") { Kind::Shared } else { Kind::Static })),
-            _ => bail!("dependents ask for it to be linked both static and shared (set `link` in the root nomake.toml to choose)"),
+            1 => Ok(Some(if self.links.contains("shared") {
+                Kind::Shared
+            } else {
+                Kind::Static
+            })),
+            _ => bail!(
+                "dependents ask for it to be linked both static and shared (set `link` {hint} to choose)"
+            ),
         }
     }
 }
@@ -294,6 +414,7 @@ struct Loader<'a> {
     done: HashMap<PathBuf, usize>,
     stack: Vec<PathBuf>,
     roots: Vec<PathBuf>,
+    has_root_package: bool,
 }
 
 impl Loader<'_> {
@@ -325,8 +446,13 @@ impl Loader<'_> {
                 .find_map(|root| self.links.get(&(root.clone(), key.clone())))
                 .cloned()
             else {
+                let hint = if self.has_root_package {
+                    "the root nomake.toml"
+                } else {
+                    "a workspace member's nomake.toml"
+                };
                 bail!(
-                    "package '{}' needs peer dependency '{key}'; add it to [dependencies] of the root nomake.toml",
+                    "package '{}' needs peer dependency '{key}'; add it to [dependencies] of {hint}",
                     manifest.package.name
                 );
             };
@@ -380,13 +506,13 @@ impl Loader<'_> {
             pch: manifest.build.pch.map(|path| dir.join(path)),
             link_flags: manifest.build.link_flags,
             libs: manifest.build.libs,
-            crt: manifest.build.crt,
             subsystem: manifest.build.subsystem,
             generate: manifest.generate,
             deps,
             reexports,
             peers,
             toolchain: manifest.toolchain,
+            test_args: manifest.test.args,
         });
         self.done.insert(dir.to_path_buf(), idx);
         Ok(idx)
@@ -556,6 +682,91 @@ mod tests {
         assert!(sdl < ui && ws.pkgs[ui].peers == [sdl] && ws.pkgs[ui].deps.is_empty());
         let ws = app("sdl = { path = \"../sdl\" }\nui = { path = \"../ui\" }\n").unwrap();
         assert!(ws.pkgs.iter().all(|p| p.peers.is_empty()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_workspace_load_shares_features_crt_and_checks_link_and_name_conflicts() {
+        let root = std::env::temp_dir().join(format!("nomake_ws_scan_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        write(
+            &root,
+            "dual/nomake.toml",
+            "[package]\nname = \"dual\"\ntype = [\"shared\", \"static\"]\n[sources]\nfiles = [\"base.c\"]\n[features]\ndefault = []\n[feature.extra]\nsources.files = [\"extra.c\"]\n",
+        );
+        write(&root, "dual/base.c", "");
+        write(&root, "dual/extra.c", "");
+
+        write(
+            &root,
+            "app/nomake.toml",
+            "[package]\nname = \"app\"\n[build]\ncrt = \"static\"\n[dependencies]\ndual = { path = \"../dual\", link = \"static\", features = [\"extra\"] }\n",
+        );
+        write(&root, "app/main.c", "");
+        write(
+            &root,
+            "suite/nomake.toml",
+            "[package]\nname = \"suite\"\ntype = \"test\"\n[dependencies]\ndual = { path = \"../dual\" }\n",
+        );
+        write(&root, "suite/t.c", "");
+
+        let all = [root.join("app"), root.join("suite")];
+        // Loading ONLY `suite` still enables `dual`'s `extra` feature, links `dual` static, and uses `app`'s static CRT.
+        let ws = load_project(
+            &root,
+            &all,
+            std::slice::from_ref(&all[1]),
+            false,
+            None,
+            Os::host(),
+        )
+        .unwrap();
+        assert_eq!(ws.pkgs.len(), 2);
+        let dual = &ws.pkgs[0];
+        assert_eq!(dual.kind, Kind::Static);
+        assert_eq!(source_names(dual), ["base.c", "extra.c"]);
+        assert_eq!(ws.crt().unwrap(), crate::config::Crt::Static);
+
+        // Conflicting root `link` modes across workspace members must fail naming both members.
+        write(
+            &root,
+            "suite/nomake.toml",
+            "[package]\nname = \"suite\"\ntype = \"test\"\n[dependencies]\ndual = { path = \"../dual\", link = \"shared\" }\n",
+        );
+        let err = load_project(&root, &all, &all, false, None, Os::host())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("conflicting link modes")
+                && err.contains("'app'")
+                && err.contains("'suite'"),
+            "{err}"
+        );
+
+        // Duplicate package names across workspace members fail with pure-workspace wording.
+        write(
+            &root,
+            "suite/nomake.toml",
+            "[package]\nname = \"app\"\ntype = \"test\"\n",
+        );
+        let err = load_project(
+            &root,
+            &all,
+            std::slice::from_ref(&all[1]),
+            false,
+            None,
+            Os::host(),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            err.contains("two packages are named 'app'")
+                && err.contains("workspace member's nomake.toml"),
+            "{err}"
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -87,7 +87,15 @@ pub fn generate_for(root_dir: &Path, member_dirs: &[PathBuf], archs: &[Arch]) ->
     }
     let vs_dir = root_dir.join("build").join("vs");
     fs::create_dir_all(&vs_dir)?;
-    let ws = scanner::load_roots(root_dir, member_dirs, crate::config::Os::host())?;
+    let has_root_package = member_dirs.contains(&root_dir.to_path_buf());
+    let ws = scanner::load_project(
+        root_dir,
+        member_dirs,
+        member_dirs,
+        has_root_package,
+        None,
+        crate::config::Os::host(),
+    )?;
     let tc = Toolchain::detect(&ws.root().toolchain, Arch::host(), &root_dir.join("build"))?;
     let workspace = !(member_dirs.len() == 1 && member_dirs[0] == root_dir);
     let ctx = Context {

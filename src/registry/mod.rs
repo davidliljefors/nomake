@@ -13,6 +13,7 @@ mod version;
 
 pub use browse::{catalog, details, Details, Entry};
 pub use commands::run as command;
+pub(crate) use version::matches as version_matches;
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -70,11 +71,8 @@ pub struct Resolver {
     registry: Registry,
     lock: Lock,
     src: PathBuf,
+    /// Located jobs held back until needed (`fetch_for_paths` for nested `path` manifests, `fetch_dirs` for active packages).
     jobs: Vec<fetch::Job>,
-    /// Located jobs held back during `lock_only` passes; fetched only if a nested `path` manifest is missing.
-    deferred: Vec<fetch::Job>,
-    /// Locate without queueing sources: for locking the dependencies of targets that are not being built.
-    lock_only: bool,
 }
 
 impl Resolver {
@@ -91,13 +89,7 @@ impl Resolver {
             lock,
             src: cache_dir()?.join("src"),
             jobs: Vec::new(),
-            deferred: Vec::new(),
-            lock_only: false,
         })
-    }
-
-    pub fn lock_only(&mut self) {
-        self.lock_only = true;
     }
 
     /// Picks the version (the locked one when it satisfies `requirement`) and queues its sources for fetching.
@@ -124,41 +116,50 @@ impl Resolver {
         });
         let job = fetch::Job::new(&self.src, name, &recipe.version, source);
         let root = job.dest.clone();
-        if self.lock_only {
-            self.deferred.push(job);
-        } else {
-            self.jobs.push(job);
-        }
+        self.jobs.push(job);
         Ok(Located {
             root,
             recipe: recipe.path,
         })
     }
 
-    /// Fetches the sources of every located dependency that isn't in the cache yet, in parallel.
-    pub fn fetch(&mut self) -> Result<()> {
-        fetch::fetch_all(&std::mem::take(&mut self.jobs))
-    }
-
-    /// Fetches only deferred packages whose cached source tree is needed to read a nested `path` manifest in `level`.
+    /// Fetches only queued packages whose cached source tree is needed to read a nested `path` manifest in `level`.
     pub fn fetch_for_paths(&mut self, level: &[(PathBuf, PathBuf)]) -> Result<()> {
         let missing: Vec<&Path> = level
             .iter()
             .filter_map(|(_, file)| (!file.is_file()).then_some(file.as_path()))
             .collect();
-        if missing.is_empty() || self.deferred.is_empty() {
+        if missing.is_empty() || self.jobs.is_empty() {
             return Ok(());
         }
         let mut needed = Vec::new();
         let mut kept = Vec::new();
-        for job in std::mem::take(&mut self.deferred) {
+        for job in std::mem::take(&mut self.jobs) {
             if missing.iter().any(|file| file.starts_with(&job.dest)) {
                 needed.push(job);
             } else {
                 kept.push(job);
             }
         }
-        self.deferred = kept;
+        self.jobs = kept;
+        if needed.is_empty() {
+            return Ok(());
+        }
+        fetch::fetch_all(&needed)
+    }
+
+    /// Fetches queued packages whose destination directory is in `dirs`.
+    pub fn fetch_dirs(&mut self, dirs: &std::collections::HashSet<PathBuf>) -> Result<()> {
+        let mut needed = Vec::new();
+        let mut kept = Vec::new();
+        for job in std::mem::take(&mut self.jobs) {
+            if dirs.contains(&job.dest) {
+                needed.push(job);
+            } else {
+                kept.push(job);
+            }
+        }
+        self.jobs = kept;
         if needed.is_empty() {
             return Ok(());
         }
@@ -322,7 +323,7 @@ mod tests {
         crate::scanner::load(&project, Os::Linux).unwrap();
         assert!(lock().contains("5.4.7") && !lock().contains("5.4.8"));
 
-        crate::scanner::update(&project, &[]).unwrap();
+        crate::scanner::update(&project, std::slice::from_ref(&project), true, &[]).unwrap();
         assert!(lock().contains("5.4.8") && lock().contains("base"));
         fs::remove_dir_all(root).unwrap();
     }
@@ -449,11 +450,119 @@ mod tests {
             &web_rev,
             "[dependencies]\nbroken = { path = \"missing\" }\n",
         );
-        let error = crate::scanner::update(&project, &[])
+        let error = crate::scanner::update(&project, std::slice::from_ref(&project), true, &[])
             .err()
             .unwrap()
             .to_string();
         assert!(error.contains("missing") && error.contains("not found"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_workspace_loads_keep_all_member_locks_and_check_version_pins() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = env::temp_dir().join(format!("nomake_ws_lock_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (repo, rev) = repo_with_commit(&root);
+        let registry = root.join("registry");
+        let publish = |name: &str, version: &str| {
+            let dir = registry.join(name).join(version);
+            fs::create_dir_all(&dir).unwrap();
+            let git = repo.display().to_string().replace('\\', "/");
+            fs::write(
+                dir.join("nomake.toml"),
+                format!(
+                    "[package]\nname = \"{name}\"\ntype = \"static\"\n[source]\ngit = \"{git}\"\nrev = \"{rev}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        env::set_var("NOMAKE_HOME", root.join("home"));
+        env::set_var("NOMAKE_REGISTRY", &registry);
+        publish("lz4", "1.10.0");
+        publish("lz4", "1.10.1");
+        publish("xxhash", "0.8.2");
+        publish("doctest", "2.4.11");
+
+        let ws_dir = crate::util::absolute(&root.join("ws"));
+        let app = ws_dir.join("app");
+        let tool = ws_dir.join("tool");
+        let suite = ws_dir.join("suite");
+        for dir in [&app, &tool, &suite] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        // Compatible member pins: "1" + "1.10.0" -> resolves to 1.10.0 (not 1.10.1).
+        fs::write(
+            app.join("nomake.toml"),
+            "[package]\nname = \"app\"\n[dependencies]\nlz4 = { version = \"1\" }\nxxhash = { version = \"0.8\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            tool.join("nomake.toml"),
+            "[package]\nname = \"tool\"\n[dependencies]\nlz4 = { version = \"1.10.0\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            suite.join("nomake.toml"),
+            "[package]\nname = \"suite\"\ntype = \"test\"\n[dependencies]\ndoctest = { version = \"2.4\" }\n",
+        )
+        .unwrap();
+
+        let all = [app.clone(), tool.clone(), suite.clone()];
+        // Load ONLY `suite` (`nomake test` equivalent): all three registry deps must be locked,
+        // `lz4` pinned to 1.10.0, and only `doctest` fetched to disk.
+        let loaded = crate::scanner::load_project(
+            &ws_dir,
+            &all,
+            std::slice::from_ref(&suite),
+            false,
+            None,
+            Os::host(),
+        )
+        .unwrap();
+        assert_eq!(
+            loaded
+                .pkgs
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["doctest", "suite"]
+        );
+        let lock = fs::read_to_string(ws_dir.join("nomake.lock")).unwrap();
+        assert!(
+            lock.contains("name = \"lz4\"\nversion = \"1.10.0\""),
+            "{lock}"
+        );
+        assert!(lock.contains("name = \"xxhash\""), "{lock}");
+        assert!(lock.contains("name = \"doctest\""), "{lock}");
+        let fetched: Vec<String> = fs::read_dir(root.join("home/src"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(fetched.len(), 1);
+        assert!(fetched[0].starts_with("doctest-2.4.11-"));
+
+        // Incompatible member version pins ("1.9" vs "1.10") must fail naming both members.
+        publish("lz4", "1.9.4");
+        fs::write(
+            app.join("nomake.toml"),
+            "[package]\nname = \"app\"\n[dependencies]\nlz4 = { version = \"1.9\" }\n",
+        )
+        .unwrap();
+        let err = crate::scanner::load_project(&ws_dir, &all, &all, false, None, Os::host())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("conflicting versions for 'lz4'")
+                && err.contains("'app'")
+                && err.contains("'tool'"),
+            "{err}"
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 }

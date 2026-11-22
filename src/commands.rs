@@ -57,11 +57,9 @@ fn plan(
     roots: &[PathBuf],
 ) -> Result<(scanner::Workspace, Toolchain, Graph)> {
     let root_dir = absolute(Path::new("."));
-    let ws = if roots.is_empty() {
-        scanner::load(&root_dir, arch.os())?
-    } else {
-        scanner::load_roots(&root_dir, roots, arch.os())?
-    };
+    let single = [root_dir.clone()];
+    let chosen = if roots.is_empty() { &single } else { roots };
+    let ws = scanner::load_project(&root_dir, chosen, chosen, true, None, arch.os())?;
     let build_root = root_dir.join("build");
     let tc = Toolchain::detect(&ws.root().toolchain, arch, &build_root)?;
     let host = if arch != Arch::host() {

@@ -17,7 +17,9 @@ pub fn run(args: &[String], root: &Path) -> Result<()> {
     let rest = &args[args.len().min(1)..];
     match (args.first().map(String::as_str), rest) {
         (Some("add"), [spec]) => add(root, spec),
-        (Some("update"), names) => crate::scanner::update(root, names),
+        (Some("update"), names) => {
+            crate::scanner::update(root, std::slice::from_ref(&root.to_path_buf()), true, names)
+        }
         (Some("list"), []) => list(root),
         (Some("search"), text) => search(&text.join(" ")),
         (Some("info"), [name]) => info(name),
@@ -65,7 +67,9 @@ fn add(root: &Path, spec: &str) -> Result<()> {
     model.write()?;
     println!("nomake: added {name} = {{ version = \"{requirement}\" }}");
     // Resolving the project locks the new dependency and fetches its sources.
-    crate::scanner::load(root, crate::config::Os::host()).map(|_| ())
+    let roots = [root.to_path_buf()];
+    crate::scanner::load_project(root, &roots, &roots, true, None, crate::config::Os::host())
+        .map(|_| ())
 }
 
 fn list(root: &Path) -> Result<()> {
