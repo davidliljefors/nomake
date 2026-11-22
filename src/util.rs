@@ -112,8 +112,9 @@ fn expand(dir: &Path, comps: &[&str], out: &mut Vec<PathBuf>) {
             return;
         };
         for entry in entries.flatten() {
-            let hidden = entry.file_name().to_string_lossy().starts_with('.');
-            if !hidden && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let name = entry.file_name();
+            let skip = name.to_string_lossy().starts_with('.') || name == "build";
+            if !skip && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 expand(&entry.path(), comps, out);
             }
         }
@@ -122,10 +123,14 @@ fn expand(dir: &Path, comps: &[&str], out: &mut Vec<PathBuf>) {
             return;
         };
         for entry in entries.flatten() {
-            if seg_match(
-                first.as_bytes(),
-                entry.file_name().to_string_lossy().as_bytes(),
-            ) {
+            let name = entry.file_name();
+            let text = name.to_string_lossy();
+            if !rest.is_empty()
+                && ((text.starts_with('.') && !first.starts_with('.')) || text == "build")
+            {
+                continue;
+            }
+            if seg_match(first.as_bytes(), text.as_bytes()) {
                 expand(&entry.path(), rest, out);
             }
         }

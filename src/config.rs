@@ -87,12 +87,14 @@ pub struct Manifest {
     pub include_defaults: bool,
 }
 
-/// `[workspace]`: package folders built together. An entry ending in `/*` takes every subfolder with a nomake.toml.
+/// `[workspace]`: package folders built together. Globs like `*` or `crates/*` match subfolders with a nomake.toml.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceDef {
     #[serde(default)]
     pub members: Vec<String>,
+    /// Default runnable member for `nomake run` and Visual Studio startup project.
+    pub primary: Option<String>,
 }
 
 /// `[test]`: how a package of type `test` is run. It passes when it exits with 0.
