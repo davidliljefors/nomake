@@ -361,16 +361,20 @@ fn load_deps(root: &Path, manifest: &Manifest) -> Vec<Dep> {
     deps
 }
 
-/// The parent project's manifest when `root` is `deps/<dir>` and not registered there yet.
+/// The parent manifest when `root` is an unregistered `deps/<dir>` or an unlisted subfolder inside a `[workspace]`.
 fn registrable_parent(root: &Path) -> Option<PathBuf> {
-    let deps_dir = root.parent()?;
-    if deps_dir.file_name()? != "deps" {
-        return None;
+    if let Some(deps_dir) = root.parent() {
+        if deps_dir.file_name().is_some_and(|n| n == "deps") {
+            let parent_toml = deps_dir.parent()?.join("nomake.toml");
+            let text = fs::read_to_string(&parent_toml).ok()?;
+            let doc = text.parse::<DocumentMut>().ok()?;
+            doc.get("package")?;
+            let dir = root.file_name()?.to_string_lossy().into_owned();
+            return (!text.contains(&format!("deps/{dir}"))).then_some(parent_toml);
+        }
     }
-    let parent_toml = deps_dir.parent()?.join("nomake.toml");
-    let text = fs::read_to_string(&parent_toml).ok()?;
-    let dir = root.file_name()?.to_string_lossy().into_owned();
-    (!text.contains(&format!("deps/{dir}"))).then_some(parent_toml)
+    let (ws_dir, covered) = crate::workspace::find_enclosing_workspace(root)?;
+    (!covered).then(|| ws_dir.join("nomake.toml"))
 }
 
 impl Model {
@@ -930,8 +934,18 @@ impl Model {
         Ok(written)
     }
 
-    /// Adds `deps/<dir>` to the parent project's `[dependencies]`.
+    /// Adds `deps/<dir>` to the parent project's `[dependencies]`, or `<rel>` to an enclosing `[workspace] members`.
     fn register_in_parent(&self, parent_toml: &Path) -> Result<()> {
+        let in_deps = self
+            .root
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .is_some_and(|name| name == "deps");
+        if !in_deps {
+            let ws_dir = parent_toml.parent().unwrap();
+            let rel = rel_str(ws_dir, &self.root);
+            return crate::workspace::add_workspace_member(parent_toml, &rel);
+        }
         let dir = self.root.file_name().unwrap().to_string_lossy();
         let text = fs::read_to_string(parent_toml)?;
         let line = format!("{} = {{ path = \"deps/{dir}\" }}", toml_key(&self.name));
@@ -1026,6 +1040,16 @@ pub fn init(yes: bool, kind_flag: Option<Kind>) -> Result<()> {
     let root = absolute(Path::new("."));
     let manifest_path = root.join("nomake.toml");
     if manifest_path.exists() {
+        if let Ok(text) = fs::read_to_string(&manifest_path) {
+            if let Ok(doc) = text.parse::<DocumentMut>() {
+                if doc.get("workspace").is_some() && doc.get("package").is_none() {
+                    bail!(
+                        "{} already defines a workspace (use `nomake new <name>` to create a member, or `nomake configure <member>` to edit one)",
+                        manifest_path.display()
+                    );
+                }
+            }
+        }
         bail!(
             "{} already exists (use `nomake configure` to edit it)",
             manifest_path.display()
@@ -1042,13 +1066,51 @@ pub fn init(yes: bool, kind_flag: Option<Kind>) -> Result<()> {
     Ok(())
 }
 
-pub fn configure() -> Result<()> {
-    let mut model = Model::open(&absolute(Path::new(".")), None)?;
+pub fn configure(
+    project: &crate::workspace::Project,
+    cwd: &Path,
+    selectors: &[String],
+) -> Result<()> {
+    if selectors.len() > 1 {
+        bail!("'nomake configure' takes at most one package selector");
+    }
+    let target_dir = if !selectors.is_empty() {
+        project.select(cwd, selectors)?[0].dir.clone()
+    } else if let Some(idx) = project.default_member {
+        project.members[idx].dir.clone()
+    } else {
+        let names: Vec<&str> = project.members.iter().map(|m| m.name.as_str()).collect();
+        bail!(
+            "workspace root has no [package]; run 'nomake configure <member>' (members: {})",
+            names.join(", ")
+        );
+    };
+
+    let mut model = Model::open(&target_dir, None)?;
+    let reg_snapshot = |m: &Model| -> Vec<(String, Option<String>)> {
+        m.deps
+            .iter()
+            .filter(|d| d.on && d.version.is_some())
+            .map(|d| (d.key.clone(), d.version.clone()))
+            .collect()
+    };
+    let before = reg_snapshot(&model);
     if !tui::run(&mut model)? {
         println!("aborted");
         return Ok(());
     }
     report(model.write()?);
+    if reg_snapshot(&model) != before {
+        let all_roots = project.member_dirs();
+        crate::scanner::load_project(
+            &project.root_dir,
+            &all_roots,
+            std::slice::from_ref(&target_dir),
+            project.has_root_package,
+            None,
+            crate::config::Os::host(),
+        )?;
+    }
     Ok(())
 }
 
@@ -1175,6 +1237,54 @@ sources.files = [\"win.cpp\"]
         let index = model.add_dep("src/sub").unwrap();
         assert_eq!(model.deps[index].path, "src/sub");
         assert!(model.add_dep("missing").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn init_registers_new_member_in_enclosing_workspace_unless_glob_covers_it() {
+        let root = std::env::temp_dir().join(format!("nomake_init_ws_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let ws = absolute(&root.join("ws"));
+        fs::create_dir_all(ws.join("extra/src")).unwrap();
+        fs::write(ws.join("extra/src/a.cpp"), "int f() { return 1; }\n").unwrap();
+        fs::write(
+            ws.join("nomake.toml"),
+            "# workspace header\n[workspace]\nmembers = [\"app\"]\n",
+        )
+        .unwrap();
+
+        // Explicit `members` list: scanning `ws/extra` sets `register = true` and appends `"extra"`.
+        let model = Model::scan(&ws.join("extra"), None);
+        assert!(model.register);
+        assert_eq!(
+            model.parent_toml.as_deref(),
+            Some(ws.join("nomake.toml").as_path())
+        );
+        model.write().unwrap();
+        let ws_text = fs::read_to_string(ws.join("nomake.toml")).unwrap();
+        assert!(ws_text.contains("# workspace header"), "{ws_text}");
+        assert!(
+            ws_text.contains("members = [\"app\", \"extra\"]"),
+            "{ws_text}"
+        );
+
+        // Glob `members = ["*"]`: already covers `ws/other`, so `parent_toml` is `None`.
+        fs::write(ws.join("nomake.toml"), "[workspace]\nmembers = [\"*\"]\n").unwrap();
+        fs::create_dir_all(ws.join("other/src")).unwrap();
+        fs::write(ws.join("other/src/b.cpp"), "int g() { return 2; }\n").unwrap();
+        let glob_model = Model::scan(&ws.join("other"), None);
+        assert!(!glob_model.register && glob_model.parent_toml.is_none());
+
+        // `deps/<dir>` inside a pure workspace (no `[package]`) must NOT try to add `[dependencies]` to the workspace root.
+        fs::create_dir_all(ws.join("deps/helper/src")).unwrap();
+        fs::write(
+            ws.join("deps/helper/src/h.c"),
+            "int h(void) { return 0; }\n",
+        )
+        .unwrap();
+        let dep_model = Model::scan(&ws.join("deps/helper"), None);
+        assert!(dep_model.parent_toml.is_none());
+
         fs::remove_dir_all(root).unwrap();
     }
 }

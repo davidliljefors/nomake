@@ -32,11 +32,11 @@ USAGE:
 COMMANDS:
     new <name> [--lib|--shared]  Create a new project
     init [-y] [--lib|--shared]   Create nomake.toml for current directory
-    configure                    Interactive project and dependency configuration
-    add <name>[@version]         Add a registry dependency
-    update [name...]             Update locked dependencies
-    list | search | info         Inspect registry dependencies
-    cache clean                  Remove cached dependency sources
+    configure [pkg]                       Interactive project and dependency configuration
+    add <name>[@version] [-p PKG]         Add a registry dependency
+    update [name...]                      Update locked dependencies
+    list | search | info                  Inspect registry dependencies
+    cache clean                           Remove cached dependency sources
     build [pkg...] [-r] [-a ARCH] [-j N]  Build packages
     run [pkg] [-r] [-a ARCH] [-- args]    Build and run executable
     test [pkg...] [-r] [-a ARCH] [-- args] Build and run tests
@@ -160,11 +160,24 @@ fn real_main() -> Result<i32> {
             }
             return commands::new(name, args.kind.unwrap_or(Kind::Executable)).map(|_| 0);
         }
-        "configure" => return init::configure().map(|_| 0),
+        "configure" => {
+            if args.workspace {
+                bail!("cannot combine '--workspace' with 'nomake configure'");
+            }
+            let here = util::absolute(std::path::Path::new("."));
+            let project = workspace::Project::discover(&here, Os::host())?;
+            let mut selectors = args.packages.clone();
+            selectors.extend(args.positional.iter().cloned());
+            return init::configure(&project, &here, &selectors).map(|_| 0);
+        }
         "add" | "update" | "list" | "search" | "info" | "cache" => {
+            if args.workspace && command == "add" {
+                bail!("cannot combine '--workspace' with 'nomake add'");
+            }
             let mut words = vec![command.clone()];
             words.extend(args.positional.iter().cloned());
-            return registry::command(&words, &std::env::current_dir()?).map(|_| 0);
+            let here = util::absolute(std::path::Path::new("."));
+            return registry::command(&words, &args.packages, &here).map(|_| 0);
         }
         "build" | "b" | "run" | "r" | "test" | "t" | "clean" | "compdb" | "vs" => {}
         other => bail!("unknown command '{other}' (try `nomake help`)"),

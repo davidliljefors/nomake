@@ -7,33 +7,79 @@ use super::cache_dir;
 use super::index::Registry;
 use super::lock::Lock;
 use super::version;
-use crate::config::Manifest;
+use crate::config::{Manifest, Os};
 use crate::init::{Dep, Model};
+use crate::workspace::Project;
 use crate::Result;
 
-const USAGE: &str = "usage: nomake <add <name>[@version] | update [name...] | list | search [text] | info <name> | cache clean>";
+const USAGE: &str = "usage: nomake <add <name>[@version] [-p <member>] | update [name...] | list | search [text] | info <name> | cache clean>";
 
-pub fn run(args: &[String], root: &Path) -> Result<()> {
+pub fn run(args: &[String], packages: &[String], cwd: &Path) -> Result<()> {
     let rest = &args[args.len().min(1)..];
     match (args.first().map(String::as_str), rest) {
-        (Some("add"), [spec]) => add(root, spec),
-        (Some("update"), names) => {
-            crate::scanner::update(root, std::slice::from_ref(&root.to_path_buf()), true, names)
+        (Some("search"), text) => {
+            if !packages.is_empty() {
+                bail!("'nomake search' does not take '-p'");
+            }
+            search(&text.join(" "))
         }
-        (Some("list"), []) => list(root),
-        (Some("search"), text) => search(&text.join(" ")),
-        (Some("info"), [name]) => info(name),
-        (Some("cache"), [action]) if action == "clean" => clean(),
+        (Some("info"), [name]) => {
+            if !packages.is_empty() {
+                bail!("'nomake info' does not take '-p'");
+            }
+            info(name)
+        }
+        (Some("cache"), [action]) if action == "clean" => {
+            if !packages.is_empty() {
+                bail!("'nomake cache clean' does not take '-p'");
+            }
+            clean()
+        }
+        (Some("add"), [spec]) => {
+            let project = Project::discover(cwd, Os::host())?;
+            add(&project, cwd, packages, spec)
+        }
+        (Some("update"), names) => {
+            if !packages.is_empty() {
+                bail!("'nomake update' updates the workspace lockfile; pass dependency names positionally, not '-p'");
+            }
+            let project = Project::discover(cwd, Os::host())?;
+            let all_roots = project.member_dirs();
+            crate::scanner::update(
+                &project.root_dir,
+                &all_roots,
+                project.has_root_package,
+                names,
+            )
+        }
+        (Some("list"), []) => {
+            if !packages.is_empty() {
+                bail!("'nomake list' does not take '-p'");
+            }
+            let project = Project::discover(cwd, Os::host())?;
+            list(&project.root_dir)
+        }
         _ => bail!("{USAGE}"),
     }
 }
 
-/// Adds the library to `nomake.toml` and locks it. Without `@version` the newest version is used, written as
-/// a requirement that still allows its patch releases.
-fn add(root: &Path, spec: &str) -> Result<()> {
-    if !root.join("nomake.toml").is_file() {
-        bail!("no nomake.toml here (run `nomake init` first)");
+/// Adds the library to the target member's `nomake.toml` and locks `<project.root_dir>/nomake.lock`.
+fn add(project: &Project, cwd: &Path, packages: &[String], spec: &str) -> Result<()> {
+    if packages.len() > 1 {
+        bail!("'nomake add' takes at most one '-p <member>'");
     }
+    let target_dir = if !packages.is_empty() {
+        project.select(cwd, packages)?[0].dir.clone()
+    } else if let Some(idx) = project.default_member {
+        project.members[idx].dir.clone()
+    } else {
+        let names: Vec<&str> = project.members.iter().map(|m| m.name.as_str()).collect();
+        bail!(
+            "workspace root has no [package]; pass '-p <member>' (members: {}) or run inside a member directory",
+            names.join(", ")
+        );
+    };
+
     let (name, requested) = match spec.split_once('@') {
         Some((name, requirement)) => (name, Some(requirement)),
         None => (spec, None),
@@ -49,7 +95,10 @@ fn add(root: &Path, spec: &str) -> Result<()> {
     };
     registry.newest(name, &requirement)?;
 
-    let mut model = Model::open(root, None)?;
+    let toml_path = target_dir.join("nomake.toml");
+    let previous = fs::read_to_string(&toml_path)?;
+    let mut model = Model::open(&target_dir, None)?;
+    model.register = false;
     if model.deps.iter().any(|dep| dep.key == name) {
         bail!("'{name}' is already a dependency");
     }
@@ -65,11 +114,20 @@ fn add(root: &Path, spec: &str) -> Result<()> {
         link: None,
     });
     model.write()?;
+    let all_roots = project.member_dirs();
+    if let Err(err) = crate::scanner::load_project(
+        &project.root_dir,
+        &all_roots,
+        std::slice::from_ref(&target_dir),
+        project.has_root_package,
+        None,
+        Os::host(),
+    ) {
+        let _ = fs::write(&toml_path, previous);
+        return Err(err);
+    }
     println!("nomake: added {name} = {{ version = \"{requirement}\" }}");
-    // Resolving the project locks the new dependency and fetches its sources.
-    let roots = [root.to_path_buf()];
-    crate::scanner::load_project(root, &roots, &roots, true, None, crate::config::Os::host())
-        .map(|_| ())
+    Ok(())
 }
 
 fn list(root: &Path) -> Result<()> {

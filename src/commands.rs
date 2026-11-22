@@ -631,6 +631,11 @@ pub fn new(name: &str, kind: Kind) -> Result<()> {
     if dir.exists() {
         bail!("{name} already exists");
     }
+    let target_dir = crate::util::absolute(dir);
+    let pkg_name = target_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(name);
     fs::create_dir_all(dir.join("src"))?;
     let kind_str = kind.name();
     let public_inc = if kind.is_program() {
@@ -641,7 +646,7 @@ pub fn new(name: &str, kind: Kind) -> Result<()> {
     fs::write(
         dir.join("nomake.toml"),
         format!(
-            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\ntype = \"{kind_str}\"\ncxx_standard = \"20\"\n\n\
+            "[package]\nname = \"{pkg_name}\"\nversion = \"0.1.0\"\ntype = \"{kind_str}\"\ncxx_standard = \"20\"\n\n\
              [sources]\ndirs = [\"src\"]\n\n\
              [include]\npublic = {public_inc}\nprivate = [\"src\"]\n"
         ),
@@ -654,15 +659,28 @@ pub fn new(name: &str, kind: Kind) -> Result<()> {
     } else {
         fs::create_dir_all(dir.join("include"))?;
         fs::write(
-            dir.join("include").join(format!("{name}.h")),
+            dir.join("include").join(format!("{pkg_name}.h")),
             "#pragma once\n\nint answer();\n",
         )?;
         fs::write(
-            dir.join("src").join(format!("{name}.cpp")),
-            format!("#include <{name}.h>\n\nint answer() {{ return 42; }}\n"),
+            dir.join("src").join(format!("{pkg_name}.cpp")),
+            format!("#include <{pkg_name}.h>\n\nint answer() {{ return 42; }}\n"),
         )?;
     }
-    fs::write(dir.join(".gitignore"), "/build\n/compile_commands.json\n")?;
+    if let Some((ws_dir, covered)) = workspace::find_enclosing_workspace(&target_dir) {
+        if !covered {
+            let rel = crate::util::rel_str(&ws_dir, &target_dir);
+            let ws_toml = ws_dir.join("nomake.toml");
+            workspace::add_workspace_member(&ws_toml, &rel)?;
+            println!(
+                "nomake: created {name} (added \"{rel}\" to {})",
+                ws_toml.display()
+            );
+            return Ok(());
+        }
+    } else {
+        fs::write(dir.join(".gitignore"), "/build\n/compile_commands.json\n")?;
+    }
     println!("nomake: created {name}");
     Ok(())
 }

@@ -722,3 +722,123 @@ fn test_only_workspace_builds_cleanly_and_partial_builds_keep_lockfile() {
         lock_before
     );
 }
+
+#[test]
+fn workspace_add_update_list_new_and_init_share_root_manifest_and_lock() {
+    let sandbox = Sandbox::new("ws registry init");
+    let repo = sandbox.root.join("pkg_repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("src/p.c"), "int p(void) { return 3; }\n").unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["config", "core.autocrlf", "false"],
+        &["config", "user.email", "t@t"],
+        &["config", "user.name", "t"],
+        &["add", "."],
+        &["commit", "-qm", "init"],
+    ] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let rev = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let rev = rev.trim();
+    let git_url = repo.display().to_string().replace('\\', "/");
+    for (name, ver) in [("lz4", "1.10.0"), ("xxhash", "0.8.2")] {
+        sandbox.write(
+            &format!("registry/{name}/{ver}/nomake.toml"),
+            &format!(
+                "[package]\nname = \"{name}\"\ntype = \"static\"\n[source]\ngit = \"{git_url}\"\nrev = \"{rev}\"\n"
+            ),
+        );
+    }
+
+    // Pure workspace root: `init` gives workspace-specific guidance; `add` without `-p` lists members.
+    sandbox.write(
+        "ws/nomake.toml",
+        "# keep comment\n[workspace]\nmembers = [\"app\"]\n",
+    );
+    sandbox.write("ws/app/nomake.toml", "[package]\nname = \"app\"\n");
+    sandbox.write("ws/app/src/main.cpp", "int main() { return 0; }\n");
+
+    let init_root = sandbox.nomake("ws", &["init", "-y"], None);
+    assert!(!init_root.status.success());
+    assert!(text(&init_root).contains("already defines a workspace"));
+
+    let add_no_p = sandbox.nomake("ws", &["add", "lz4"], None);
+    assert!(!add_no_p.status.success());
+    assert!(
+        text(&add_no_p).contains("pass '-p <member>'") && text(&add_no_p).contains("members: app"),
+        "{}",
+        text(&add_no_p)
+    );
+
+    // `nomake new tool` inside `ws` appends `"tool"` to `[workspace] members` and skips `ws/tool/.gitignore`.
+    let created = sandbox.nomake("ws", &["new", "tool"], None);
+    assert!(created.status.success(), "{}", text(&created));
+    assert!(!sandbox.exists("ws/tool/.gitignore"));
+    let ws_toml = fs::read_to_string(sandbox.root.join("ws/nomake.toml")).unwrap();
+    assert!(
+        ws_toml.contains("# keep comment") && ws_toml.contains("members = [\"app\", \"tool\"]"),
+        "{ws_toml}"
+    );
+
+    // `nomake add lz4 -p app` from root and `nomake add xxhash` from `ws/tool` both lock ONLY `ws/nomake.lock`.
+    let add_app = sandbox.nomake("ws", &["add", "lz4", "-p", "app"], None);
+    assert!(add_app.status.success(), "{}", text(&add_app));
+    assert!(sandbox.exists("ws/nomake.lock") && !sandbox.exists("ws/app/nomake.lock"));
+
+    let add_tool = sandbox.nomake("ws/tool", &["add", "xxhash"], None);
+    assert!(add_tool.status.success(), "{}", text(&add_tool));
+    assert!(!sandbox.exists("ws/tool/nomake.lock"));
+
+    let listed = sandbox.nomake("ws/tool", &["list"], None);
+    assert!(listed.status.success(), "{}", text(&listed));
+    assert!(text(&listed).contains("lz4 1.10.0") && text(&listed).contains("xxhash 0.8.2"));
+
+    // Hybrid `[package] + [workspace]`: `nomake update` upgrades sub-member deps without dropping them!
+    sandbox.write(
+        "registry/lz4/1.10.1/nomake.toml",
+        &format!(
+            "[package]\nname = \"lz4\"\ntype = \"static\"\n[source]\ngit = \"{git_url}\"\nrev = \"{rev}\"\n"
+        ),
+    );
+    sandbox.write(
+        "hybrid/nomake.toml",
+        "[package]\nname = \"root_app\"\n[workspace]\nmembers = [\"sub\"]\n",
+    );
+    sandbox.write("hybrid/src/main.cpp", "int main() { return 0; }\n");
+    sandbox.write(
+        "hybrid/sub/nomake.toml",
+        "[package]\nname = \"sub\"\ntype = \"static\"\n[dependencies]\nlz4 = { version = \"1.10\" }\n",
+    );
+    sandbox.write("hybrid/sub/src/s.c", "int s(void) { return 1; }\n");
+
+    let updated = sandbox.nomake("hybrid", &["update"], None);
+    assert!(updated.status.success(), "{}", text(&updated));
+    let hybrid_lock = fs::read_to_string(sandbox.root.join("hybrid/nomake.lock")).unwrap();
+    assert!(
+        hybrid_lock.contains("name = \"lz4\"\nversion = \"1.10.1\""),
+        "{hybrid_lock}"
+    );
+
+    // Glob workspace `members = ["*"]`: `nomake new extra` does not duplicate `"*"` in `members`.
+    sandbox.write("glob_ws/nomake.toml", "[workspace]\nmembers = [\"*\"]\n");
+    let new_glob = sandbox.nomake("glob_ws", &["new", "extra"], None);
+    assert!(new_glob.status.success(), "{}", text(&new_glob));
+    assert_eq!(
+        fs::read_to_string(sandbox.root.join("glob_ws/nomake.toml")).unwrap(),
+        "[workspace]\nmembers = [\"*\"]\n"
+    );
+}

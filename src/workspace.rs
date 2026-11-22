@@ -382,6 +382,69 @@ impl Project {
     }
 }
 
+/// Finds the nearest enclosing `[workspace]` for `target_dir` (skipping `deps/`, `build/`, and hidden folders)
+/// and reports `(workspace_dir, already_matched_by_members)`.
+pub(crate) fn find_enclosing_workspace(target_dir: &Path) -> Option<(PathBuf, bool)> {
+    let target_dir = absolute(target_dir);
+    let mut cur = target_dir.parent();
+    while let Some(dir) = cur {
+        let rel_path = target_dir.strip_prefix(dir).ok()?;
+        if rel_path.components().any(|comp| {
+            let name = comp.as_os_str().to_string_lossy();
+            name == "deps" || name == "build" || name.starts_with('.')
+        }) {
+            return None;
+        }
+        let toml_path = dir.join("nomake.toml");
+        if let Ok(text) = fs::read_to_string(&toml_path) {
+            if let Ok(doc) = text.parse::<toml_edit::DocumentMut>() {
+                if let Some(ws) = doc.get("workspace").and_then(|item| item.as_table_like()) {
+                    let rel = rel_str(dir, &target_dir);
+                    let covered = ws
+                        .get("members")
+                        .and_then(|item| item.as_array())
+                        .is_some_and(|arr| {
+                            arr.iter().filter_map(|v| v.as_str()).any(|entry| {
+                                let pat = entry.replace('\\', "/");
+                                let pat = pat.trim_end_matches('/');
+                                if pat.contains('*') || pat.contains('?') {
+                                    util::matches(pat, &rel)
+                                } else {
+                                    absolute(&dir.join(pat)) == target_dir
+                                }
+                            })
+                        });
+                    return Some((dir.to_path_buf(), covered));
+                }
+            }
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// Appends `rel` to `[workspace] members` in `ws_toml` via `toml_edit`, preserving formatting and comments.
+pub(crate) fn add_workspace_member(ws_toml: &Path, rel: &str) -> Result<()> {
+    let text = fs::read_to_string(ws_toml)?;
+    let mut doc: toml_edit::DocumentMut = text.parse()?;
+    let ws = doc
+        .entry("workspace")
+        .or_insert(toml_edit::table())
+        .as_table_like_mut()
+        .ok_or("[workspace] is not a table")?;
+    let members = ws
+        .entry("members")
+        .or_insert_with(|| toml_edit::value(toml_edit::Array::new()));
+    let array = members
+        .as_array_mut()
+        .ok_or("[workspace] members is not an array")?;
+    if !array.iter().any(|v| v.as_str() == Some(rel)) {
+        array.push(rel);
+    }
+    fs::write(ws_toml, doc.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

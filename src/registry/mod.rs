@@ -263,6 +263,7 @@ mod tests {
         let run = |args: &[&str]| {
             command(
                 &args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+                &[],
                 &project,
             )
         };
