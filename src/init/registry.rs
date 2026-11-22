@@ -263,15 +263,14 @@ impl RegistryView {
     pub fn draw(&mut self, frame: &mut Frame, area: Rect, deps: &[Dep]) {
         if !self.loaded {
             frame.render_widget(
-                Paragraph::new(" Loading the registry...")
-                    .block(Block::bordered().title(" Registry ")),
+                Paragraph::new(" Loading registry...").block(Block::bordered().title(" Registry ")),
                 area,
             );
             return;
         }
         if !self.error.is_empty() {
             let lines = vec![
-                Line::styled("Cannot read the registry:", Style::new().fg(Color::Red)),
+                Line::styled("Cannot read registry:", Style::new().fg(Color::Red)),
                 Line::raw(self.error.clone()),
             ];
             frame.render_widget(
@@ -339,9 +338,9 @@ impl RegistryView {
             .collect();
         if items.is_empty() {
             let text = if self.entries.is_empty() {
-                "The registry has no libraries."
+                "Registry is empty."
             } else {
-                "No library matches."
+                "No matches."
             };
             frame.render_widget(
                 Paragraph::new(text).style(Style::new().fg(Color::Gray)),
@@ -406,7 +405,7 @@ impl RegistryView {
         match dep {
             Some(dep) => {
                 lines.push(Line::styled(
-                    "In this project (Right to edit, Left or Esc back):",
+                    "In project (Right to edit, Left or Esc back):",
                     Style::new().fg(Color::Cyan),
                 ));
                 lines.push(Line::styled(

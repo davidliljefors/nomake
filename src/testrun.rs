@@ -93,7 +93,7 @@ fn run_one(
 /// The result is the exit code: 0 when every test passed.
 pub fn run(project: &Project, opts: &BuildOpts, tests: &[Test], extra: &[String]) -> Result<i32> {
     if tests.is_empty() {
-        bail!("no test packages (a package with type = \"test\" is one)");
+        bail!("no test packages (set type = \"test\")");
     }
     let test_dirs: Vec<PathBuf> = tests.iter().map(|test| test.dir.clone()).collect();
     let verbose = opts.verbose;
@@ -131,7 +131,7 @@ pub fn run(project: &Project, opts: &BuildOpts, tests: &[Test], extra: &[String]
                 println!("FAILED ({summary}exit code {code}, {took:.2?})")
             }
             Outcome::Failed(None) => {
-                println!("FAILED ({summary}terminated abnormally, {took:.2?})")
+                println!("FAILED ({summary}terminated by signal, {took:.2?})")
             }
             Outcome::TimedOut(limit) => println!("FAILED (timed out after {limit}s)"),
         }

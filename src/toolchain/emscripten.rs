@@ -55,7 +55,7 @@ pub fn provision() -> Result<Vec<(String, String)>> {
 
     if !dir.join(script).is_file() {
         eprintln!(
-            "nomake: em++ not found, installing the Emscripten SDK into {}",
+            "nomake: em++ not found, installing emsdk into {}",
             dir.display()
         );
         if let Some(parent) = dir.parent() {
@@ -68,7 +68,7 @@ pub fn provision() -> Result<Vec<(String, String)>> {
         )?;
     }
     for step in ["install", "activate"] {
-        eprintln!("nomake: emsdk {step} latest (one time, this downloads a few hundred MB)");
+        eprintln!("nomake: emsdk {step} latest (one-time download, a few hundred MB)");
         run_visible(
             Command::new(dir.join(script))
                 .args([step, "latest"])
@@ -125,7 +125,7 @@ fn activated_env(dir: &Path) -> Result<Vec<(String, String)>> {
         .collect();
     if env.is_empty() {
         bail!(
-            "emsdk_env produced no environment; delete {} and retry",
+            "emsdk_env produced no environment (delete {} and retry)",
             dir.display()
         );
     }
@@ -147,7 +147,7 @@ pub fn artifact(kind: Kind, name: &str) -> Result<(String, String)> {
             (file.clone(), file)
         }
         Kind::Shared => bail!(
-            "Emscripten cannot build shared libraries; use type = \"static\" (or link = \"static\")"
+            "Emscripten cannot build shared libraries (use type = \"static\" or link = \"static\")"
         ),
     })
 }

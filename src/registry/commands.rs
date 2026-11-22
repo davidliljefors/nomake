@@ -41,7 +41,7 @@ pub fn run(args: &[String], packages: &[String], cwd: &Path) -> Result<()> {
         }
         (Some("update"), names) => {
             if !packages.is_empty() {
-                bail!("'nomake update' updates the workspace lockfile; pass dependency names positionally, not '-p'");
+                bail!("'nomake update' does not take '-p' (name dependencies instead)");
             }
             let project = Project::discover(cwd, Os::host())?;
             let all_roots = project.member_dirs();
@@ -75,7 +75,7 @@ fn add(project: &Project, cwd: &Path, packages: &[String], spec: &str) -> Result
     } else {
         let names: Vec<&str> = project.members.iter().map(|m| m.name.as_str()).collect();
         bail!(
-            "workspace root has no [package]; pass '-p <member>' (members: {}) or run inside a member directory",
+            "workspace root has no [package], pass '-p <member>' or cd into one (members: {})",
             names.join(", ")
         );
     };

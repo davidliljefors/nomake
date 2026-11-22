@@ -248,10 +248,7 @@ fn vcvars_env(arch: Arch) -> Result<Vec<(String, String)>> {
         .output()?;
     let install = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if install.is_empty() {
-        bail!(
-            "Visual Studio with the C++ tools for {} was not found",
-            arch.name()
-        );
+        bail!("Visual Studio C++ tools for {} not found", arch.name());
     }
     let vcvarsall = Path::new(&install).join(r"VC\Auxiliary\Build\vcvarsall.bat");
     let output = Command::new("cmd")
@@ -387,10 +384,7 @@ fn driver_linker(
     let output = command.output()?;
     let text = String::from_utf8_lossy(&output.stderr);
     let Some(line) = text.lines().rev().find(|line| line.contains("lld-link")) else {
-        bail!(
-            "could not find the lld-link command in `{} -###`",
-            cxx.display()
-        );
+        bail!("lld-link not found in `{} -###`", cxx.display());
     };
     let words: Vec<String> = quoted_words(line)
         .into_iter()
@@ -416,7 +410,7 @@ fn target_args_for(family: Family, arch: Arch, os: Os) -> Result<Vec<String>> {
         Family::Gcc if arch == host => Ok(Vec::new()),
         Family::Gcc if arch == Arch::X86 && host == Arch::X64 => Ok(vec!["-m32".into()]),
         Family::Gcc => bail!(
-            "g++ cannot target {}; set CXX or [toolchain] cxx to a cross compiler",
+            "g++ cannot target {} (set CXX or [toolchain] cxx to a cross compiler)",
             arch.name()
         ),
     }
@@ -471,7 +465,7 @@ impl Toolchain {
             };
             if (family == Family::Emscripten) != (os == Os::Emscripten) {
                 bail!(
-                    "{candidate} and -a {} do not go together: em++ only builds wasm32",
+                    "{candidate} does not match -a {} (em++ targets wasm32 only)",
                     arch.name()
                 );
             }

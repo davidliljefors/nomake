@@ -56,7 +56,7 @@ fn lock_build(root_dir: &Path) -> Result<File> {
     match file.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {
-            eprintln!("nomake: waiting for build lock...");
+            eprintln!("nomake: waiting for build lock");
             file.lock()?;
         }
         Err(TryLockError::Error(err)) => return Err(err.into()),
@@ -308,9 +308,7 @@ pub fn build(
             opts.arch.os(),
         )?;
         refresh_compdb_if_present(project, &all_roots, None, opts.arch, opts.release)?;
-        println!(
-            "nomake: nothing to build (all workspace members are test packages; run 'nomake test')"
-        );
+        println!("nomake: nothing to build, all packages are tests (use 'nomake test')");
         return Ok(Built {
             ok: true,
             targets: Vec::new(),
@@ -386,7 +384,7 @@ pub fn run(
     args: &[String],
 ) -> Result<i32> {
     if selectors.len() > 1 {
-        bail!("'nomake run' takes at most one package name (pass program arguments after '--')");
+        bail!("'nomake run' takes one package (program arguments go after '--')");
     }
     let member: &Member = if !selectors.is_empty() {
         let chosen = project.select(cwd, selectors)?;
@@ -404,7 +402,7 @@ pub fn run(
         if !member.kind.is_program() {
             if project.is_workspace {
                 bail!(
-                    "package '{}' is a {} library, not an executable (pass '-p <name>' or '-w' to run a workspace executable)",
+                    "package '{}' is a {} library, not an executable (use -p <name> or -w)",
                     member.name,
                     member.kind.name()
                 );
@@ -440,7 +438,7 @@ pub fn run(
             [first, ..] => {
                 let names: Vec<&str> = exes.iter().map(|m| m.name.as_str()).collect();
                 bail!(
-                    "multiple executables in workspace ({}); pass a package name (`nomake run <name>`) or set `primary = \"{}\"` under [workspace]",
+                    "multiple executables ({}), name one or set primary = \"{}\" under [workspace]",
                     names.join(", "),
                     first.name
                 );

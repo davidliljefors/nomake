@@ -31,8 +31,8 @@ USAGE:
 
 COMMANDS:
     new <name> [--lib|--shared]           Create a new project
-    init [-y] [--lib|--shared]            Create nomake.toml for current directory
-    configure [pkg]                       Interactive project and dependency configuration
+    init [-y] [--lib|--shared]            Create nomake.toml in the current directory
+    configure [pkg]                       Edit nomake.toml interactively
     add <name>[@version] [-p PKG]         Add a registry dependency
     update [name...]                      Update locked dependencies
     list | search | info                  Inspect registry dependencies
@@ -195,7 +195,7 @@ fn real_main() -> Result<i32> {
 
     if command == "vs" {
         if !selectors.is_empty() {
-            bail!("'nomake vs' covers the whole workspace and takes no package selectors");
+            bail!("'nomake vs' takes no package selectors");
         }
         let archs = if args.archs.is_empty() {
             vec![Arch::host()]
@@ -243,7 +243,7 @@ fn real_main() -> Result<i32> {
         }
         "compdb" => {
             if !selectors.is_empty() {
-                bail!("'nomake compdb' covers the whole workspace and takes no package selectors");
+                bail!("'nomake compdb' takes no package selectors");
             }
             commands::compdb(&project, arch, args.release).map(|_| 0)
         }

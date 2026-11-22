@@ -244,7 +244,7 @@ fn spin(seen: &AtomicUsize, done: &AtomicBool) {
             continue;
         }
         eprint!(
-            "\r{} Scanning directories... {} entries (Ctrl+C to cancel)",
+            "\r{} scanning, {} entries (Ctrl+C to cancel)",
             FRAMES[frame % FRAMES.len()],
             seen.load(Relaxed)
         );
@@ -543,7 +543,7 @@ impl Model {
         }
         let key = dir.file_name().unwrap().to_string_lossy().into_owned();
         if self.deps.iter().any(|dep| dep.key == key) {
-            bail!("a dependency named '{key}' is already listed");
+            bail!("'{key}' is already a dependency");
         }
         let path = if dir.starts_with(&self.root) {
             rel_str(&self.root, &dir)
@@ -1044,14 +1044,14 @@ pub fn init(yes: bool, kind_flag: Option<Kind>) -> Result<()> {
             if let Ok(doc) = text.parse::<DocumentMut>() {
                 if doc.get("workspace").is_some() && doc.get("package").is_none() {
                     bail!(
-                        "{} already defines a workspace (use `nomake new <name>` to create a member, or `nomake configure <member>` to edit one)",
+                        "{} already defines a workspace (use `nomake new <name>` or `nomake configure <member>`)",
                         manifest_path.display()
                     );
                 }
             }
         }
         bail!(
-            "{} already exists (use `nomake configure` to edit it)",
+            "{} already exists (use `nomake configure`)",
             manifest_path.display()
         );
     }
@@ -1072,7 +1072,7 @@ pub fn configure(
     selectors: &[String],
 ) -> Result<()> {
     if selectors.len() > 1 {
-        bail!("'nomake configure' takes at most one package selector");
+        bail!("'nomake configure' takes one package");
     }
     let target_dir = if !selectors.is_empty() {
         project.select(cwd, selectors)?[0].dir.clone()
@@ -1081,7 +1081,7 @@ pub fn configure(
     } else {
         let names: Vec<&str> = project.members.iter().map(|m| m.name.as_str()).collect();
         bail!(
-            "workspace root has no [package]; run 'nomake configure <member>' (members: {})",
+            "workspace root has no [package], use 'nomake configure <member>' (members: {})",
             names.join(", ")
         );
     };

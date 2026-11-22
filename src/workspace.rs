@@ -59,7 +59,7 @@ fn parse_file(path: &Path, os: Os) -> Result<Parsed> {
                     format!("'{key}'")
                 };
                 bail!(
-                    "{}: workspace nomake.toml has no [package]; put {label} in a member's nomake.toml (only [workspace] and [toolchain] are allowed here)",
+                    "{}: {label} is not allowed in a workspace nomake.toml (only [workspace] and [toolchain])",
                     path.display()
                 );
             }
@@ -68,10 +68,7 @@ fn parse_file(path: &Path, os: Os) -> Result<Parsed> {
             toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         return Ok(Parsed::Workspace(ws));
     }
-    bail!(
-        "{}: expected a [package] or [workspace] table",
-        path.display()
-    );
+    bail!("{}: needs [package] or [workspace]", path.display());
 }
 
 fn member_from(dir: PathBuf, manifest: &Manifest) -> Member {
@@ -159,7 +156,7 @@ fn load_workspace(
                     let rel = rel_str(&root_dir, &dir);
                     let label = if rel.is_empty() { "." } else { &rel };
                     bail!(
-                        "workspace member '{label}' is itself a [workspace]; list its member packages in {}",
+                        "workspace member '{label}' is a workspace, list its packages in {}",
                         root_toml.display()
                     );
                 }
@@ -167,7 +164,7 @@ fn load_workspace(
         };
         if let Some(prev) = members.iter().find(|other| other.name == manifest.0) {
             bail!(
-                "two packages are named '{}': {} and {}",
+                "duplicate package name '{}' in {} and {}",
                 manifest.0,
                 prev.dir.display(),
                 dir.display()
@@ -181,21 +178,21 @@ fn load_workspace(
         });
     }
     if members.is_empty() {
-        bail!("[workspace] in {} lists no members", root_toml.display());
+        bail!("{}: [workspace] has no members", root_toml.display());
     }
     let primary = match &def.primary {
         Some(name) => {
             let Some(idx) = members.iter().position(|m| m.name == *name) else {
                 let known: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
                 bail!(
-                    "{}: [workspace] primary '{name}' is not a workspace member (members: {})",
+                    "{}: primary '{name}' is not a workspace member (members: {})",
                     root_toml.display(),
                     known.join(", ")
                 );
             };
             if !members[idx].kind.is_program() {
                 bail!(
-                    "{}: [workspace] primary '{name}' is a {} library, not an executable",
+                    "{}: primary '{name}' is a {} library, not an executable",
                     root_toml.display(),
                     members[idx].kind.name()
                 );
@@ -345,7 +342,7 @@ pub(crate) fn select_items(
                             .map(|&i| rel_str(root_dir, items[i].1))
                             .collect();
                         bail!(
-                            "ambiguous package selector '{sel}' matches multiple folders ({}); pass a package name or path",
+                            "ambiguous package selector '{sel}' matches {}",
                             paths.join(", ")
                         );
                     }
@@ -605,7 +602,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            err.contains("[dependencies]") && err.contains("no [package]"),
+            err.contains("[dependencies]") && err.contains("not allowed"),
             "{err}"
         );
 
@@ -629,7 +626,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            err.contains("inner") && err.contains("itself a [workspace]"),
+            err.contains("inner") && err.contains("is a workspace"),
             "{err}"
         );
 

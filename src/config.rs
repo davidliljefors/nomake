@@ -262,7 +262,7 @@ impl Package {
             .enumerate()
             .all(|(at, kind)| !kinds[..at].contains(kind));
         if kinds.is_empty() || (kinds.len() > 1 && !libraries) || !unique {
-            bail!("type must be one kind, or a list of different libraries such as [\"shared\", \"static\"]");
+            bail!("type must be one kind or a list of distinct libraries, e.g. [\"shared\", \"static\"]");
         }
         Ok(())
     }
@@ -436,7 +436,7 @@ impl Generate {
         }
         if self.tool.is_some() && self.batch {
             bail!(
-                "[[generate]] '{}': a tool step runs once per input",
+                "[[generate]] '{}': `batch` is not allowed with `tool`",
                 self.label()
             );
         }
@@ -542,7 +542,7 @@ impl Manifest {
                         theirs.is_some() && mine != theirs
                     };
                     if differs(&dep.path, &extra.path) || differs(&dep.version, &extra.version) {
-                        bail!("[target.{name}.dependencies] {key}: conflicts with the entry in [dependencies]");
+                        bail!("[target.{name}.dependencies] {key}: conflicts with [dependencies]");
                     }
                     dep.public = extra.public.unwrap_or(dep.public);
                     dep.default_features = extra.default_features.unwrap_or(dep.default_features);
@@ -611,7 +611,7 @@ impl Manifest {
             Some(kind) => {
                 if !offered.contains(&kind) {
                     bail!(
-                        "package '{}' cannot be built as {kind:?}; it offers {:?}",
+                        "package '{}' cannot be built as {kind:?} (offers {:?})",
                         self.package.name,
                         offered
                     );

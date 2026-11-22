@@ -55,7 +55,7 @@ impl Workspace {
         for (name, mode) in &self.crts {
             match chosen {
                 Some((first, other)) if other != *mode => bail!(
-                    "crt: '{first}' wants {} but '{name}' wants {}; one build uses one runtime",
+                    "crt: '{first}' wants {}, '{name}' wants {}",
                     other.name(),
                     mode.name()
                 ),
@@ -130,7 +130,7 @@ pub fn load_project(
     for root in all_roots {
         if root != lock_dir && root.join("nomake.lock").is_file() {
             eprintln!(
-                "nomake: warning: ignoring {}; workspace lockfile is {}",
+                "nomake: warning: ignoring {} (workspace lockfile is {})",
                 root.join("nomake.lock").display(),
                 lock_dir.join("nomake.lock").display()
             );
@@ -331,7 +331,7 @@ fn read_manifests(
                                 );
                             } else if !registry::version_matches(prev_req, req) {
                                 bail!(
-                                    "conflicting versions for '{key}': '{prev_pkg}' wants '{prev_req}' but '{}' wants '{req}'",
+                                    "conflicting versions for '{key}': '{prev_pkg}' wants '{prev_req}', '{}' wants '{req}'",
                                     manifest.package.name
                                 );
                             }
@@ -369,7 +369,7 @@ fn read_manifests(
                 "in a workspace member's nomake.toml"
             };
             bail!(
-                "two packages are named '{name}': {} and {} (two versions of one registry dependency? pin it {hint})",
+                "duplicate package name '{name}' in {} and {} (pin one version {hint})",
                 prev.display(),
                 dir.display()
             );
@@ -421,7 +421,7 @@ impl Wanted {
             for (other_pkg, other_kind) in &self.root_links[1..] {
                 if other_kind != first_kind {
                     bail!(
-                        "conflicting link modes: '{first_pkg}' wants {} but '{other_pkg}' wants {}",
+                        "conflicting link modes: '{first_pkg}' wants {}, '{other_pkg}' wants {}",
                         first_kind.name(),
                         other_kind.name()
                     );
@@ -441,9 +441,7 @@ impl Wanted {
             } else {
                 Kind::Static
             })),
-            _ => bail!(
-                "dependents ask for it to be linked both static and shared (set `link` {hint} to choose)"
-            ),
+            _ => bail!("dependents want both static and shared (set `link` {hint})"),
         }
     }
 }
@@ -495,7 +493,7 @@ impl Loader<'_> {
                     "a workspace member's nomake.toml"
                 };
                 bail!(
-                    "package '{}' needs peer dependency '{key}'; add it to [dependencies] of {hint}",
+                    "package '{}' needs peer '{key}' (add it to [dependencies] in {hint})",
                     manifest.package.name
                 );
             };
@@ -805,7 +803,7 @@ mod tests {
         .unwrap()
         .to_string();
         assert!(
-            err.contains("two packages are named 'app'")
+            err.contains("duplicate package name 'app'")
                 && err.contains("workspace member's nomake.toml"),
             "{err}"
         );

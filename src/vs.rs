@@ -83,7 +83,7 @@ struct VsProject {
 /// Generates `<root_dir>/build/vs/<name>.sln` and per-package `.vcxproj` files for `project`.
 pub fn generate(project: &Project, archs: &[Arch]) -> Result<()> {
     if archs.contains(&Arch::Wasm32) {
-        bail!("`nomake vs` cannot target wasm32; use `nomake compdb -a wasm32` for editor support");
+        bail!("`nomake vs` cannot target wasm32 (use `nomake compdb -a wasm32`)");
     }
     let root_dir = &project.root_dir;
     let vs_dir = root_dir.join("build").join("vs");

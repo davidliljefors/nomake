@@ -55,7 +55,7 @@ fn write_log(file: File, messages: mpsc::Receiver<Message>) {
     let mut check = |result: std::io::Result<()>| {
         if let Err(err) = result {
             if !std::mem::replace(&mut warned, true) {
-                eprintln!("nomake: warning: cannot write the build state, the next build will redo work: {err}");
+                eprintln!("nomake: warning: cannot write build state: {err}");
             }
         }
     };

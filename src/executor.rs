@@ -262,7 +262,7 @@ impl<'a> Ctx<'a> {
             return Some("command line changed".into());
         }
         if entry.mtime != oldest_output {
-            return Some("an output was modified outside the build".into());
+            return Some("output modified outside the build".into());
         }
         // Inputs are measured against what the last run saw, not against outputs a tool may have left alone.
         self.ins[idx].iter().chain(&entry.deps).find_map(|&dep| {
@@ -354,7 +354,7 @@ impl<'a> Ctx<'a> {
             Ok(rsp) => rsp,
             Err(err) => {
                 self.report(format!(
-                    "FAILED: {}\ncannot write the response file: {err}\n",
+                    "FAILED: {}\ncannot write response file: {err}\n",
                     node.desc
                 ));
                 return None;
@@ -373,7 +373,7 @@ impl<'a> Ctx<'a> {
             Ok(output) => output,
             Err(err) => {
                 self.report(format!(
-                    "FAILED: {}\n{}\ncould not run {}: {err}\n",
+                    "FAILED: {}\n{}\ncannot run {}: {err}\n",
                     node.desc,
                     node.command_line(),
                     node.program.display()
@@ -433,7 +433,7 @@ impl<'a> Ctx<'a> {
             let mtime = stat(Path::new(&self.stats.paths[out as usize]));
             if mtime == 0 {
                 self.report(format!(
-                    "FAILED: {}\nexpected output was not produced: {}\n",
+                    "FAILED: {}\nmissing output {}\n",
                     node.desc, self.stats.paths[out as usize]
                 ));
                 return None;

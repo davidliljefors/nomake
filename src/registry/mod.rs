@@ -105,7 +105,7 @@ impl Resolver {
         };
         if locked.is_some_and(|entry| entry.rev != source.rev) {
             bail!(
-                "the recipe for {name} {} changed since it was locked (run `nomake update {name}`)",
+                "recipe for {name} {} changed since locking (run `nomake update {name}`)",
                 recipe.version
             );
         }

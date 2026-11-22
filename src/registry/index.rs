@@ -60,7 +60,7 @@ impl Registry {
     pub fn names(&mut self) -> Result<Vec<String>> {
         self.ensure()?;
         let entries = fs::read_dir(&self.dir)
-            .map_err(|e| format!("cannot read the registry at {}: {e}", self.dir.display()))?;
+            .map_err(|e| format!("cannot read registry at {}: {e}", self.dir.display()))?;
         let mut names: Vec<String> = entries
             .flatten()
             .filter(|entry| entry.path().is_dir())
@@ -87,7 +87,7 @@ impl Registry {
         let temp = self.dir.with_extension("tmp");
         let _ = fs::remove_dir_all(&temp);
         fs::create_dir_all(self.dir.parent().unwrap())?;
-        println!("nomake: fetching the registry");
+        println!("nomake: fetching registry");
         run(Command::new("git")
             .args(["clone", "-q", "--depth", "1", REGISTRY_URL])
             .arg(&temp))?;
@@ -130,7 +130,7 @@ fn exact(registry: &Path, name: &str, version: &str) -> Result<Recipe> {
     let path = registry.join(name).join(version).join("nomake.toml");
     if !path.is_file() {
         bail!(
-            "'{name}' has no version {version} in the registry at {}",
+            "'{name}' has no version {version} in registry at {}",
             registry.display()
         );
     }
@@ -161,10 +161,7 @@ fn newest(registry: &Path, name: &str, requirement: &str) -> Result<Recipe> {
 fn versions_in(registry: &Path, name: &str) -> Result<Vec<String>> {
     check_names(name, "0")?;
     let Ok(entries) = fs::read_dir(registry.join(name)) else {
-        bail!(
-            "no library named '{name}' in the registry at {}",
-            registry.display()
-        );
+        bail!("no library '{name}' in registry at {}", registry.display());
     };
     let mut versions: Vec<String> = entries
         .flatten()
