@@ -25,16 +25,16 @@ For an existing project, run `nomake init`.
 
 | Command | Description |
 | --- | --- |
-| `nomake new <name> [--lib\|--shared]` | Create a new project |
+| `nomake new <name> [--lib\|--shared]` | Create a new project (registers in enclosing `[workspace]`) |
 | `nomake init [-y]` | Generate `nomake.toml` for the current directory |
-| `nomake configure` | Interactive project and dependency editor |
-| `nomake build` | Build project |
-| `nomake run [-- args]` | Build and run executable |
-| `nomake test [-- args]` | Build and run `type = "test"` packages |
-| `nomake clean` | Remove `build/` (keeps `build/vs/`) |
+| `nomake configure [pkg]` | Interactive project and dependency editor |
+| `nomake build [pkg...]` | Build packages |
+| `nomake run [pkg] [-- args]` | Build and run executable |
+| `nomake test [pkg...] [-- args]` | Build and run `type = "test"` packages |
+| `nomake clean [pkg...]` | Remove `build/` or specific packages' artifacts (keeps `build/vs/`) |
 | `nomake compdb` | Write `compile_commands.json` |
 | `nomake vs` | Write a Visual Studio solution to `build/vs/` |
-| `nomake add <name>[@version]` | Add and lock a registry dependency |
+| `nomake add <name>[@version] [-p pkg]` | Add and lock a registry dependency |
 | `nomake update [name...]` | Update locked dependencies |
 | `nomake list` | List locked dependencies |
 | `nomake search [text]` | Search the registry |
@@ -45,6 +45,8 @@ For an existing project, run `nomake init`.
 | --- | --- |
 | `-r`, `--release` | Release build |
 | `-a`, `--arch ARCH` | `x64`, `x86`, `arm64`, or `wasm32` (default: host; `vs` accepts a comma list) |
+| `-p`, `--package PKG` | Target package (repeatable) |
+| `-w`, `--workspace` | Operate on the whole workspace (from inside a member directory) |
 | `-j`, `--jobs N` | Parallel jobs (default: all cores) |
 | `-v`, `--verbose` | Print executed commands |
 | `-d explain` | Print why targets rebuild |
@@ -165,8 +167,9 @@ imgui = { version = "1", features = ["opengl"], default-features = false }
 Registry packages live at `<name>/<version>/nomake.toml` with a `[source]` table (`git` URL and 40-char commit `rev`). Resolved versions are recorded in `nomake.lock` and sources are cached under `NOMAKE_HOME` (`%LOCALAPPDATA%\nomake` or `~/.cache/nomake`).
 
 ```
-nomake add lua      # adds lua = { version = "5.4" } and writes nomake.lock
-nomake update lua   # updates within 5.4.x
+nomake add lua          # adds lua = { version = "5.4" } and writes nomake.lock
+nomake add lua -p app   # adds lua to workspace member 'app' and locks in root nomake.lock
+nomake update lua       # updates within 5.4.x
 ```
 
 Libraries that support both linkage modes set `type = ["shared", "static"]` (with optional `[build] shared_defines`), defaulting to `shared` on native targets and falling back to `static` on targets without shared libraries (`wasm32`). Dependents can override with `link = "static"` or `link = "shared"` (in `[dependencies]` or `[target.<os>.dependencies]`).
@@ -240,21 +243,28 @@ nomake vs
 nomake vs -a x64,arm64
 ```
 
-Generates an NMake-based solution in `build/vs/<name>.sln` that delegates build/clean to `nomake`.
+Generates an NMake-based solution in `build/vs/<name>.sln` with per-project build/clean/rebuild commands, `ProjectDependencies`, debugger working directories, and pre-generated `<nomake/tests.h>` headers. `Build Solution` builds non-test workspace members (matching `nomake build`); test suites and dependency projects under `deps/` can be built or debugged individually.
 
-Multi-package repositories can define `[workspace]` in the root `nomake.toml`:
+Multi-package repositories can define `[workspace]` in the root `nomake.toml` (either standalone with an optional `[toolchain]`, or alongside a root `[package]`):
 
 ```toml
 [workspace]
 members = ["my-lib", "my-lib/tests", "tools/*"]
+primary = "app"                 # optional: default executable for `nomake run` and VS startup project
 ```
+
+All workspace members share a single `build/`, `nomake.lock`, `compile_commands.json`, and `build/vs/` at the workspace root. Running `nomake` inside a member directory automatically discovers the enclosing workspace and defaults target selection to that member (pass `-w` / `--workspace` to target the whole workspace).
 
 ```
 nomake build                # build all non-test members in a single graph
-nomake build app tests      # build specific members
-nomake run app              # run a member (defaults to first executable)
+nomake build app my-lib     # build specific packages (or -p app -p my-lib)
+nomake clean my-lib         # clean only my-lib's objects and artifacts
+nomake run                  # run primary, current member, or the sole non-test executable
+nomake run tool -- --help   # build and run a named executable with arguments
 nomake test                 # build and run all test members
 ```
+
+When `nomake run` is invoked at workspace scope without a package name, it picks `[workspace] primary` if set, or the only non-test executable if there is exactly one (and errors if multiple executables exist without `primary`).
 
 ## Examples
 

@@ -30,8 +30,8 @@ USAGE:
     nomake <command> [options]
 
 COMMANDS:
-    new <name> [--lib|--shared]  Create a new project
-    init [-y] [--lib|--shared]   Create nomake.toml for current directory
+    new <name> [--lib|--shared]           Create a new project
+    init [-y] [--lib|--shared]            Create nomake.toml for current directory
     configure [pkg]                       Interactive project and dependency configuration
     add <name>[@version] [-p PKG]         Add a registry dependency
     update [name...]                      Update locked dependencies
@@ -202,7 +202,7 @@ fn real_main() -> Result<i32> {
         } else {
             args.archs
         };
-        return vs::generate_for(&project.root_dir, &project.member_dirs(), &archs).map(|_| 0);
+        return vs::generate(&project, &archs).map(|_| 0);
     }
 
     let arch = single_arch(&args)?;

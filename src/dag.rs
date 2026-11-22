@@ -532,7 +532,7 @@ const TEST_RUNNER_C: &str = include_str!("testsupport/runner.c");
 
 /// Writes the test runner next to the package's generated files and returns the path of its source.
 /// Files are only rewritten when their content changes so they don't invalidate the build.
-fn write_test_support(gen_dir: &Path) -> Result<PathBuf> {
+pub(crate) fn write_test_support(gen_dir: &Path) -> Result<PathBuf> {
     let dir = gen_dir.join("nomake");
     std::fs::create_dir_all(&dir)?;
     for (name, text) in [("tests.h", TESTS_H), ("runner.c", TEST_RUNNER_C)] {

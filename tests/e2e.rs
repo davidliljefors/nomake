@@ -842,3 +842,150 @@ fn workspace_add_update_list_new_and_init_share_root_manifest_and_lock() {
         "[workspace]\nmembers = [\"*\"]\n"
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn vs_solution_builds_under_parallel_msbuild_without_lock_or_state_corruption() {
+    let Some(pf86) = std::env::var_os("ProgramFiles(x86)") else {
+        return;
+    };
+    let vswhere = PathBuf::from(pf86).join(r"Microsoft Visual Studio\Installer\vswhere.exe");
+    if !vswhere.exists() {
+        return;
+    }
+    let found = Command::new(&vswhere)
+        .args([
+            "-latest",
+            "-requires",
+            "Microsoft.Component.MSBuild",
+            "-find",
+            r"MSBuild\**\Bin\MSBuild.exe",
+        ])
+        .output()
+        .unwrap();
+    let msbuild = String::from_utf8_lossy(&found.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if msbuild.is_empty() || !Path::new(&msbuild).exists() {
+        return;
+    }
+
+    let sandbox = Sandbox::new("vs msbuild");
+    let repo = sandbox.root.join("tiny_repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("src/tiny.c"), "int tiny(void) { return 7; }\n").unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["config", "core.autocrlf", "false"],
+        &["config", "user.email", "t@t"],
+        &["config", "user.name", "t"],
+        &["add", "."],
+        &["commit", "-qm", "init"],
+    ] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let rev = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let git_url = repo.display().to_string().replace('\\', "/");
+    sandbox.write(
+        "registry/tiny/1.0.0/nomake.toml",
+        &format!(
+            "[package]\nname = \"tiny\"\ntype = \"static\"\n[source]\ngit = \"{git_url}\"\nrev = \"{}\"\n",
+            rev.trim()
+        ),
+    );
+
+    sandbox.write(
+        "ws/nomake.toml",
+        "[workspace]\nmembers = [\"suite\", \"mathlib\", \"app\", \"tool\"]\nprimary = \"tool\"\n",
+    );
+    sandbox.write(
+        "ws/mathlib/nomake.toml",
+        "[package]\nname = \"mathlib\"\ntype = \"static\"\n",
+    );
+    sandbox.write(
+        "ws/mathlib/src/m.cpp",
+        "int add(int a, int b) { return a + b; }\n",
+    );
+    sandbox.write(
+        "ws/app/nomake.toml",
+        "[package]\nname = \"app\"\n[dependencies]\nmathlib = { path = \"../mathlib\" }\ntiny = { version = \"1\" }\n",
+    );
+    sandbox.write(
+        "ws/app/src/main.cpp",
+        "extern \"C\" int tiny(void);\nint add(int, int);\nint main() { return add(1, 2) + tiny() - 10; }\n",
+    );
+    sandbox.write(
+        "ws/tool/nomake.toml",
+        "[package]\nname = \"tool\"\n[dependencies]\nmathlib = { path = \"../mathlib\" }\n",
+    );
+    sandbox.write(
+        "ws/tool/src/main.cpp",
+        "int add(int, int);\nint main() { return add(2, 3) - 5; }\n",
+    );
+    sandbox.write(
+        "ws/suite/nomake.toml",
+        "[package]\nname = \"suite\"\ntype = \"test\"\n[test]\nargs = [\"--verbose\"]\n",
+    );
+    sandbox.write(
+        "ws/suite/src/t.c",
+        "#include <nomake/tests.h>\nTEST(ok) { TEST_CHECK(1); }\n",
+    );
+
+    // Run `nomake vs -a x64` from inside member `ws/app` to verify walk-up writes `ws/build/vs/ws.sln`.
+    let vs = sandbox.nomake("ws/app", &["vs", "-a", "x64"], None);
+    if text(&vs).contains("no C++ compiler found") {
+        return;
+    }
+    assert!(vs.status.success(), "{}", text(&vs));
+    assert!(sandbox.exists("ws/build/vs/ws.sln") && !sandbox.exists("ws/app/build"));
+    assert!(sandbox.exists("ws/build/x64-debug/gen/suite/nomake/tests.h"));
+    let lock_before = fs::read_to_string(sandbox.root.join("ws/nomake.lock")).unwrap();
+    assert!(lock_before.contains("name = \"tiny\""), "{lock_before}");
+
+    // Build solution in parallel (`MSBuild.exe /m`); `build/.lock` serializes contending `nomake` invocations.
+    let reg_dir = sandbox.root.join("registry");
+    let built = Command::new(&msbuild)
+        .args([
+            "/m",
+            "/nologo",
+            "/p:Configuration=Debug",
+            "/p:Platform=x64",
+            r"build\vs\ws.sln",
+        ])
+        .current_dir(sandbox.root.join("ws"))
+        .env("NOMAKE_HOME", sandbox.root.join("home"))
+        .env("NOMAKE_REGISTRY", &reg_dir)
+        .output()
+        .unwrap();
+    assert!(built.status.success(), "{}", text(&built));
+
+    // Non-test members built; `suite` (`type = "test"`) skipped by `Build Solution`.
+    assert!(sandbox.exists("ws/build/x64-debug/app.exe"));
+    assert!(sandbox.exists("ws/build/x64-debug/tool.exe"));
+    assert!(!sandbox.exists("ws/build/x64-debug/suite.exe"));
+    assert_eq!(
+        fs::read_to_string(sandbox.root.join("ws/nomake.lock")).unwrap(),
+        lock_before
+    );
+
+    // Subsequent CLI `nomake build -a x64` sees an intact `.nomake_state` with zero stale targets!
+    let noop = sandbox.nomake("ws", &["build", "-a", "x64"], None);
+    assert!(noop.status.success(), "{}", text(&noop));
+    assert!(text(&noop).contains("no work to do"), "{}", text(&noop));
+}

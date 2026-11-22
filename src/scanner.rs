@@ -33,7 +33,6 @@ pub struct Pkg {
     /// Packages from the root project's dependencies that this package's headers and defines come from, without linking or depending on them.
     pub peers: Vec<usize>,
     pub toolchain: Toolchain,
-    #[allow(dead_code)]
     pub test_args: Vec<String>,
 }
 

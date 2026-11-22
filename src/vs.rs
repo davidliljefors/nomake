@@ -5,10 +5,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::commands::out_dir;
-use crate::dag::compile_scope;
+use crate::config::{Kind, Os};
+use crate::dag::{compile_scope, write_test_support};
 use crate::scanner::{self, is_header, Pkg, Workspace};
 use crate::toolchain::{Arch, Toolchain};
 use crate::util::{hash, hash_seeded};
+use crate::workspace::Project;
 use crate::Result;
 
 const CPP_PROJECT_TYPE: &str = "{8BC9CEB8-8B4A-11D0-9A44-00A0C91F9C40}";
@@ -58,8 +60,6 @@ struct Context<'a> {
     archs: &'a [Arch],
     root_dir: PathBuf,
     nomake: PathBuf,
-    /// Member projects name themselves on the command line so a build covers just them.
-    workspace: bool,
 }
 
 struct Item {
@@ -68,41 +68,56 @@ struct Item {
     filter: Option<String>,
 }
 
-struct Project {
+struct VsProject {
     name: String,
-    /// Part of the solution build; packages that are only dependencies are browse-only.
+    is_member: bool,
+    is_primary: bool,
+    is_test: bool,
+    is_executable: bool,
+    /// Part of `Build Solution` (`.Build.0`): non-test workspace members only, matching `nomake build`.
     builds: bool,
-    executable: bool,
+    order: usize,
+    deps: Vec<String>,
 }
 
-/// One solution in `root_dir` holding the packages in `member_dirs`, all building into its build/.
-pub fn generate_for(root_dir: &Path, member_dirs: &[PathBuf], archs: &[Arch]) -> Result<()> {
+/// Generates `<root_dir>/build/vs/<name>.sln` and per-package `.vcxproj` files for `project`.
+pub fn generate(project: &Project, archs: &[Arch]) -> Result<()> {
     if archs.contains(&Arch::Wasm32) {
         bail!("`nomake vs` cannot target wasm32; use `nomake compdb -a wasm32` for editor support");
     }
+    let root_dir = &project.root_dir;
     let vs_dir = root_dir.join("build").join("vs");
     fs::create_dir_all(&vs_dir)?;
-    let has_root_package = member_dirs.contains(&root_dir.to_path_buf());
+    let member_dirs = project.member_dirs();
     let ws = scanner::load_project(
         root_dir,
-        member_dirs,
-        member_dirs,
-        has_root_package,
+        &member_dirs,
+        &member_dirs,
+        project.has_root_package,
         None,
-        crate::config::Os::host(),
+        Os::host(),
     )?;
-    let tc = Toolchain::detect(&ws.root().toolchain, Arch::host(), &root_dir.join("build"))?;
-    let workspace = !(member_dirs.len() == 1 && member_dirs[0] == root_dir);
+    let tc_cfg = if project.is_workspace {
+        &project.toolchain
+    } else {
+        &ws.root().toolchain
+    };
+    let tc = Toolchain::detect(tc_cfg, Arch::host(), &root_dir.join("build"))?;
+    for pkg in ws.pkgs.iter().filter(|pkg| pkg.kind == Kind::Test) {
+        for config in configs(archs) {
+            let out = out_dir(root_dir, config.arch, config.release);
+            write_test_support(&out.join("gen").join(&pkg.name))?;
+        }
+    }
     let ctx = Context {
         ws: &ws,
         tc: &tc,
         archs,
-        root_dir: root_dir.to_path_buf(),
+        root_dir: root_dir.clone(),
         nomake: std::env::current_exe()?,
-        workspace,
     };
 
-    let mut projects: Vec<Project> = Vec::new();
+    let mut projects = Vec::new();
     for (index, pkg) in ws.pkgs.iter().enumerate() {
         let items = collect_items(pkg);
         fs::write(
@@ -113,15 +128,39 @@ pub fn generate_for(root_dir: &Path, member_dirs: &[PathBuf], archs: &[Arch]) ->
             vs_dir.join(format!("{}.vcxproj.filters", pkg.name)),
             filters_xml(pkg, &items),
         )?;
-        projects.push(Project {
+        let member_pos = project.members.iter().position(|m| m.dir == pkg.root);
+        let is_member = ws.roots.contains(&index);
+        let is_primary = is_member && project.primary.is_some_and(|p| Some(p) == member_pos);
+        let is_test = pkg.kind == Kind::Test;
+        let mut deps = Vec::new();
+        for &dep in pkg.deps.iter().chain(&pkg.peers) {
+            let dep_name = &ws.pkgs[dep].name;
+            if dep_name != &pkg.name && !deps.contains(dep_name) {
+                deps.push(dep_name.clone());
+            }
+        }
+        projects.push(VsProject {
             name: pkg.name.clone(),
-            builds: ws.roots.contains(&index),
-            executable: pkg.kind.is_program(),
+            is_member,
+            is_primary,
+            is_test,
+            is_executable: pkg.kind == Kind::Executable,
+            builds: is_member && !is_test,
+            order: member_pos.unwrap_or(project.members.len() + index),
+            deps,
         });
     }
-    // Visual Studio starts the first project of the solution, so programs go first.
-    projects.sort_by_key(|p| (!p.builds, !p.executable));
-    let solution_name = if workspace {
+    // Visual Studio starts the first project of the solution: prefer `[workspace] primary`, then non-test executables.
+    projects.sort_by_key(|p| {
+        (
+            !p.is_member,
+            !p.is_primary,
+            p.is_test,
+            !p.is_executable,
+            p.order,
+        )
+    });
+    let solution_name = if project.is_workspace {
         root_dir.file_name().map_or_else(
             || "nomake".to_string(),
             |n| n.to_string_lossy().into_owned(),
@@ -161,6 +200,32 @@ fn xml(text: &str) -> String {
 
 fn property(name: &str, value: &str) -> String {
     format!("    <{name}>{}</{name}>\n", xml(value))
+}
+
+fn quote_windows_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', backslashes));
+                out.push(ch);
+                backslashes = 0;
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
+    out.push('"');
+    out
 }
 
 fn condition(config: &Config) -> String {
@@ -311,14 +376,10 @@ fn config_properties(ctx: &Context, index: usize, config: &Config) -> String {
     let nomake = ctx.nomake.display();
     let flag = if release { " -r" } else { "" };
     let arch = config.arch.name();
-    let member = if ctx.workspace && ctx.ws.roots.contains(&index) {
-        format!(" {}", pkg.name)
-    } else {
-        String::new()
-    };
-    let build = format!("cd /d \"{root}\" && \"{nomake}\" build{member} --arch {arch}{flag}");
-    let clean = format!("cd /d \"{root}\" && \"{nomake}\" clean --arch {arch}{flag}");
-    let rebuild = format!("{clean} && \"{nomake}\" build{member} --arch {arch}{flag}");
+    let name = &pkg.name;
+    let build = format!("cd /d \"{root}\" && \"{nomake}\" build {name} --arch {arch}{flag}");
+    let clean = format!("cd /d \"{root}\" && \"{nomake}\" clean {name} --arch {arch}{flag}");
+    let rebuild = format!("{clean} && \"{nomake}\" build {name} --arch {arch}{flag}");
     let output = out.join(
         ctx.tc
             .artifact(pkg.kind, &pkg.name)
@@ -339,8 +400,15 @@ fn config_properties(ctx: &Context, index: usize, config: &Config) -> String {
     text.push_str(&property("AdditionalOptions", &options.join(" ")));
     text.push_str(&property(
         "LocalDebuggerWorkingDirectory",
-        &root.to_string(),
+        &pkg.root.to_string_lossy(),
     ));
+    if pkg.kind == Kind::Test && !pkg.test_args.is_empty() {
+        let joined: Vec<String> = pkg.test_args.iter().map(|a| quote_windows_arg(a)).collect();
+        text.push_str(&property(
+            "LocalDebuggerCommandArguments",
+            &joined.join(" "),
+        ));
+    }
     text
 }
 
@@ -391,9 +459,9 @@ fn filters_xml(pkg: &Pkg, items: &[Item]) -> String {
     text
 }
 
-/// Member projects build with the solution; each member's own `nomake build` already covers its dependencies.
-fn solution_text(projects: &[Project], archs: &[Arch]) -> String {
-    let has_deps = projects.iter().any(|p| !p.builds);
+/// Non-test member projects build with the solution; test suites and dependency projects still build individually on demand.
+fn solution_text(projects: &[VsProject], archs: &[Arch]) -> String {
+    let has_deps = projects.iter().any(|p| !p.is_member);
     let deps_folder = guid("nomake:deps");
     let mut text = String::new();
     text.push_str("Microsoft Visual Studio Solution File, Format Version 12.00\n");
@@ -405,6 +473,14 @@ fn solution_text(projects: &[Project], archs: &[Arch]) -> String {
             "Project(\"{CPP_PROJECT_TYPE}\") = \"{name}\", \"{name}.vcxproj\", \"{}\"\n",
             guid(name)
         ));
+        if !project.deps.is_empty() {
+            text.push_str("\tProjectSection(ProjectDependencies) = postProject\n");
+            for dep in &project.deps {
+                let dep_guid = guid(dep);
+                text.push_str(&format!("\t\t{dep_guid} = {dep_guid}\n"));
+            }
+            text.push_str("\tEndProjectSection\n");
+        }
         text.push_str("EndProject\n");
     }
     if has_deps {
@@ -443,11 +519,159 @@ fn solution_text(projects: &[Project], archs: &[Arch]) -> String {
     text.push_str("\tEndGlobalSection\n");
     if has_deps {
         text.push_str("\tGlobalSection(NestedProjects) = preSolution\n");
-        for project in projects.iter().filter(|p| !p.builds) {
+        for project in projects.iter().filter(|p| !p.is_member) {
             text.push_str(&format!("\t\t{} = {deps_folder}\n", guid(&project.name)));
         }
         text.push_str("\tEndGlobalSection\n");
     }
     text.push_str("EndGlobal\n");
     text.replace('\n', "\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::absolute;
+
+    #[test]
+    fn windows_arg_quoting_handles_spaces_quotes_and_trailing_slashes() {
+        assert_eq!(quote_windows_arg("--verbose"), "--verbose");
+        assert_eq!(quote_windows_arg(""), "\"\"");
+        assert_eq!(quote_windows_arg("math suite"), "\"math suite\"");
+        assert_eq!(quote_windows_arg("say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(quote_windows_arg("C:\\dir a\\"), "\"C:\\dir a\\\\\"");
+    }
+
+    #[test]
+    fn vs_solution_orders_startup_project_wires_deps_pregenerates_tests_h_and_per_pkg_cmds() {
+        let root = std::env::temp_dir().join(format!("nomake_vs_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let ws_dir = absolute(&root.join("ws"));
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        let write = |rel: &str, body: &str| {
+            let path = ws_dir.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        };
+        write(
+            "nomake.toml",
+            "[workspace]\nmembers = [\"suite\", \"mathlib\", \"app\", \"tool\"]\n",
+        );
+        write(
+            "deps/lz4/nomake.toml",
+            "[package]\nname = \"lz4\"\ntype = \"static\"\n",
+        );
+        write("deps/lz4/src/lz4.c", "int lz4(void) { return 4; }\n");
+        write(
+            "mathlib/nomake.toml",
+            "[package]\nname = \"mathlib\"\ntype = \"static\"\n",
+        );
+        write("mathlib/src/m.cpp", "int m() { return 1; }\n");
+        write(
+            "app/nomake.toml",
+            "[package]\nname = \"app\"\n[dependencies]\nmathlib = { path = \"../mathlib\" }\nlz4 = { path = \"../deps/lz4\" }\n",
+        );
+        write("app/src/main.cpp", "int main() { return 0; }\n");
+        write("tool/nomake.toml", "[package]\nname = \"tool\"\n");
+        write("tool/src/main.cpp", "int main() { return 0; }\n");
+        write(
+            "suite/nomake.toml",
+            "[package]\nname = \"suite\"\ntype = \"test\"\n[test]\nargs = [\"--verbose\", \"--filter\", \"math suite\"]\n",
+        );
+        write(
+            "suite/src/t.c",
+            "#include <nomake/tests.h>\nTEST(ok) { TEST_CHECK(1); }\n",
+        );
+
+        let project = Project::discover(&ws_dir, Os::host()).unwrap();
+        if let Err(err) = generate(&project, &[Arch::X64]) {
+            if err.to_string().contains("no C++ compiler found") {
+                let _ = fs::remove_dir_all(&root);
+                return;
+            }
+            panic!("{err}");
+        }
+
+        // 1. `<nomake/tests.h>` is pre-generated for both Debug and Release on a clean tree.
+        assert!(ws_dir
+            .join("build/x64-debug/gen/suite/nomake/tests.h")
+            .exists());
+        assert!(ws_dir
+            .join("build/x64-release/gen/suite/nomake/tests.h")
+            .exists());
+
+        // 2. Without `primary`, `app` (first non-test executable) precedes `tool`, `mathlib`, `suite`, and `lz4`.
+        let sln = fs::read_to_string(ws_dir.join("build/vs/ws.sln")).unwrap();
+        let pos = |name: &str| {
+            sln.find(&format!("= \"{name}\", \"{name}.vcxproj\""))
+                .unwrap()
+        };
+        assert!(pos("app") < pos("tool"), "{sln}");
+        assert!(pos("tool") < pos("mathlib"), "{sln}");
+        assert!(pos("mathlib") < pos("suite"), "{sln}");
+        assert!(pos("suite") < pos("lz4"), "{sln}");
+
+        // 3. `ProjectDependencies` on `app` lists both `mathlib` and `lz4`.
+        let app_guid = guid("app");
+        let math_guid = guid("mathlib");
+        let lz4_guid = guid("lz4");
+        let suite_guid = guid("suite");
+        assert!(
+            sln.contains(&format!("{math_guid} = {math_guid}"))
+                && sln.contains(&format!("{lz4_guid} = {lz4_guid}")),
+            "{sln}"
+        );
+
+        // 4. `.Build.0` is set ONLY on non-test workspace members (`app`, `tool`, `mathlib`), NOT `suite` or `lz4`.
+        assert!(sln.contains(&format!("{app_guid}.Debug|x64.Build.0 = Debug|x64")));
+        assert!(sln.contains(&format!("{math_guid}.Debug|x64.Build.0 = Debug|x64")));
+        assert!(!sln.contains(&format!("{suite_guid}.Debug|x64.Build.0")));
+        assert!(!sln.contains(&format!("{lz4_guid}.Debug|x64.Build.0")));
+
+        // 5. `NestedProjects` puts `lz4` in `deps`, NOT `suite`.
+        let deps_guid = guid("nomake:deps");
+        assert!(sln.contains(&format!("{lz4_guid} = {deps_guid}")));
+        assert!(!sln.contains(&format!("{suite_guid} = {deps_guid}")));
+
+        // 6. `.vcxproj` files have package-dir debugger CWD, quoted test args, and per-package build/clean commands (including `deps`).
+        let app_xml = fs::read_to_string(ws_dir.join("build/vs/app.vcxproj")).unwrap();
+        assert!(app_xml.contains(&format!(
+            "<LocalDebuggerWorkingDirectory>{}</LocalDebuggerWorkingDirectory>",
+            xml(&ws_dir.join("app").to_string_lossy())
+        )));
+        assert!(!app_xml.contains("LocalDebuggerCommandArguments"));
+        assert!(app_xml.contains("build app --arch x64</NMakeBuildCommandLine>"));
+        assert!(app_xml.contains("clean app --arch x64</NMakeCleanCommandLine>"));
+
+        let suite_xml = fs::read_to_string(ws_dir.join("build/vs/suite.vcxproj")).unwrap();
+        assert!(suite_xml.contains(&format!(
+            "<LocalDebuggerWorkingDirectory>{}</LocalDebuggerWorkingDirectory>",
+            xml(&ws_dir.join("suite").to_string_lossy())
+        )));
+        assert!(suite_xml.contains(
+            "<LocalDebuggerCommandArguments>--verbose --filter &quot;math suite&quot;</LocalDebuggerCommandArguments>"
+        ));
+
+        let lz4_xml = fs::read_to_string(ws_dir.join("build/vs/lz4.vcxproj")).unwrap();
+        assert!(lz4_xml.contains("build lz4 --arch x64</NMakeBuildCommandLine>"));
+        assert!(lz4_xml.contains("clean lz4 --arch x64</NMakeCleanCommandLine>"));
+
+        // 7. Setting `primary = "tool"` promotes `tool` to the first project (VS Startup Project).
+        write(
+            "nomake.toml",
+            "[workspace]\nmembers = [\"suite\", \"mathlib\", \"app\", \"tool\"]\nprimary = \"tool\"\n",
+        );
+        let project_primary = Project::discover(&ws_dir, Os::host()).unwrap();
+        generate(&project_primary, &[Arch::X64]).unwrap();
+        let sln_primary = fs::read_to_string(ws_dir.join("build/vs/ws.sln")).unwrap();
+        let pos_p = |name: &str| {
+            sln_primary
+                .find(&format!("= \"{name}\", \"{name}.vcxproj\""))
+                .unwrap()
+        };
+        assert!(pos_p("tool") < pos_p("app"), "{sln_primary}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }
